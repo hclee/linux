@@ -214,7 +214,7 @@ static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
 				 size_t table_buf_size)
 {
 	u8 bytes_per_off;
-	u8 *buf;
+	u8 entries[2 * sizeof(__le64)], *buf;
 	u64 off[2];
 	u64 byte_off, chunk_data_size, table_size;
 	u32 bytes_to_read;
@@ -246,10 +246,7 @@ static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
 				bytes_per_off :
 				(chunk_idx ? 2 : 1) * bytes_per_off;
 
-	if (!NInoNonResident(ni))
-		return -EOPNOTSUPP;
-
-	{
+	if (NInoNonResident(ni)) {
 		sector_t start_sector = byte_off >> 9;
 		u32 sector_off = byte_off & ((1 << 9) - 1);
 		u32 sectors = DIV_ROUND_UP(sector_off + bytes_to_read, 512);
@@ -264,6 +261,37 @@ static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
 			return ret;
 		}
 		buf += sector_off;
+	} else {
+		struct ntfs_attr_search_ctx *ctx;
+		u32 value_length;
+		u16 value_offset;
+
+		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		if (!ctx) {
+			ret = -ENOMEM;
+			return ret;
+		}
+		ret = ntfs_attr_lookup(AT_DATA, (__le16 *)WOF_NAME,
+				       WOF_NAME_LEN, CASE_SENSITIVE, 0, NULL, 0,
+				       ctx);
+		if (ret)
+			goto out_put_ctx;
+
+		value_length =
+			le32_to_cpu(ctx->attr->data.resident.value_length);
+		value_offset =
+			le16_to_cpu(ctx->attr->data.resident.value_offset);
+		if (byte_off + bytes_to_read > value_length) {
+			ret = -EINVAL;
+			goto out_put_ctx;
+		}
+		memcpy(entries, (u8 *)ctx->attr + value_offset + byte_off,
+		       bytes_to_read);
+		buf = entries;
+out_put_ctx:
+		ntfs_attr_put_search_ctx(ctx);
+		if (ret)
+			return ret;
 	}
 
 	if (bytes_per_off == sizeof(__le32)) {
@@ -294,23 +322,48 @@ static int ntfs_read_wof_chunk(struct ntfs_volume *vol,
 			       u32 chunk_size, void *input, size_t input_size,
 			       char **chunk_mem)
 {
+	struct ntfs_attr_search_ctx *ctx;
 	u32 input_offset = chunk_offset & 511;
 	u32 input_size_aligned;
+	u32 value_length;
+	u16 value_offset;
 	int err;
 
 	input_size_aligned = round_up(chunk_size + input_offset, 512);
 	if (input_size_aligned > input_size)
 		return -EINVAL;
 
-	if (!NInoNonResident(wof_ni))
-		return -EOPNOTSUPP;
+	if (NInoNonResident(wof_ni)) {
+		err = ntfs_bdev_read_from_rl(vol, &wof_ni->runlist,
+					     chunk_offset >> 9,
+					     input_size_aligned >> 9, input);
+		if (err)
+			return err;
+		*chunk_mem = (u8 *)input + input_offset;
+		return 0;
+	}
 
-	err = ntfs_bdev_read_from_rl(vol, &wof_ni->runlist, chunk_offset >> 9,
-				     input_size_aligned >> 9, input);
+	ctx = ntfs_attr_get_search_ctx(wof_ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+
+	err = ntfs_attr_lookup(AT_DATA, (__le16 *)WOF_NAME, WOF_NAME_LEN,
+			       CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err)
-		return err;
-	*chunk_mem = (u8 *)input + input_offset;
-	return 0;
+		goto out_put_ctx;
+
+	value_length = le32_to_cpu(ctx->attr->data.resident.value_length);
+	value_offset = le16_to_cpu(ctx->attr->data.resident.value_offset);
+	if (chunk_offset + chunk_size > value_length) {
+		err = -EINVAL;
+		goto out_put_ctx;
+	}
+	memcpy(input, (u8 *)ctx->attr + value_offset + chunk_offset,
+	       chunk_size);
+	*chunk_mem = input;
+out_put_ctx:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
 }
 
 struct ntfs_wof_dest {
@@ -534,11 +587,7 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 	}
 
 	wof_ni = NTFS_I(wof_inode);
-	if (!NInoNonResident(wof_ni)) {
-		err = -EOPNOTSUPP;
-		goto out_iput;
-	}
-	if (!NInoFullyMapped(wof_ni)) {
+	if (NInoNonResident(wof_ni) && !NInoFullyMapped(wof_ni)) {
 		down_write(&wof_ni->runlist.lock);
 		if (!NInoFullyMapped(wof_ni))
 			err = ntfs_attr_map_whole_runlist(wof_ni);
