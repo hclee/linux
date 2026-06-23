@@ -93,6 +93,10 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 		/* Compressed data streams are handled in compress.c. */
 		if (NInoNonResident(ni) && NInoCompressed(ni))
 			return ntfs_read_compressed_block(folio);
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
+		else if (NInoWofCompressed(ni))
+			return ntfs_read_wof_compressed_block(folio);
+#endif
 	}
 
 	iomap_read_folio(&ntfs_read_iomap_ops, &ctx, NULL);
@@ -234,7 +238,8 @@ static void ntfs_readahead(struct readahead_control *rac)
 	 * Resident files are not cached in the page cache,
 	 * and readahead is not implemented for compressed files.
 	 */
-	if (!NInoNonResident(ni) || NInoCompressed(ni))
+	if (!NInoNonResident(ni) || NInoCompressed(ni) ||
+	    NInoWofCompressed(ni))
 		return;
 	iomap_readahead(&ntfs_read_iomap_ops, &ctx, NULL);
 }
