@@ -189,6 +189,9 @@ enum {
 	NI_NonResident,
 	NI_IndexAllocPresent,
 	NI_Compressed,
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
+	NI_WofCompressed,
+#endif
 	NI_Encrypted,
 	NI_Sparse,
 	NI_SparseDisabled,
@@ -248,6 +251,14 @@ NINO_FNS(MstProtected)
 NINO_FNS(NonResident)
 NINO_FNS(IndexAllocPresent)
 NINO_FNS(Compressed)
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
+NINO_FNS(WofCompressed)
+#else
+static inline int NInoWofCompressed(struct ntfs_inode *ni)
+{
+	return 0;
+}
+#endif
 NINO_FNS(Encrypted)
 NINO_FNS(Sparse)
 NINO_FNS(SparseDisabled)
