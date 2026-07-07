@@ -1467,6 +1467,9 @@ find_attr_list_attr:
 			if (rc)
 				continue;
 		}
+		if (type != AT_UNUSED &&
+		    le64_to_cpu(al_entry->lowest_vcn) > (u64)lowest_vcn)
+			goto not_found;
 		/*
 		 * The names match or @name not present and attribute is
 		 * unnamed.  Now check @lowest_vcn.  Continue search if the
