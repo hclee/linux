@@ -4042,13 +4042,17 @@ retry:
 			}
 		}
 
-		/* Update lowest vcn. */
-		a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
-		mark_mft_record_dirty(ctx->ntfs_ino);
 		if ((ctx->ntfs_ino->nr_extents == -1 || NInoAttrList(ctx->ntfs_ino)) &&
 		    ctx->attr->type != AT_ATTRIBUTE_LIST) {
 			struct attr_list_entry *ale;
 
+			/*
+			 * Look up the ALE before updating the attr record's
+			 * lowest_vcn.  ntfs_attrlist_find_ctx_ale_locked()
+			 * matches ale->lowest_vcn against the current value in
+			 * the attr record; updating the attr record first would
+			 * always cause a mismatch.
+			 */
 			down_write(&base_ni->attr_list_lock);
 			ale = ntfs_attrlist_find_ctx_ale_locked(base_ni, ctx);
 			if (!ale)
@@ -4064,9 +4068,18 @@ retry:
 			ntfs_attrlist_capture_exact(ctx, base_ni, ale,
 						 base_ni->attr_list);
 			up_write(&base_ni->attr_list_lock);
+
+			/* Update lowest vcn in attr record after ALE is fixed. */
+			a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
+			mark_mft_record_dirty(ctx->ntfs_ino);
+
 			err = ntfs_attrlist_update(base_ni);
 			if (err)
 				goto put_err_out;
+		} else {
+			/* Update lowest vcn. */
+			a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
+			mark_mft_record_dirty(ctx->ntfs_ino);
 		}
 
 		/*
