@@ -4101,6 +4101,7 @@ retry:
 		a->data.non_resident.highest_vcn = cpu_to_le64(stop_vcn - 1);
 		mark_mft_record_dirty(ctx->ntfs_ino);
 		de_cluster_count += de_cnt;
+		from_vcn = stop_vcn;
 	}
 
 	/* Check whether error occurred. */
