@@ -125,6 +125,9 @@ struct ntfs_attr_search_ctx *ntfs_attr_get_search_ctx(struct ntfs_inode *ni,
 		struct mft_record *mrec);
 void ntfs_attr_put_search_ctx(struct ntfs_attr_search_ctx *ctx);
 void ntfs_attrlist_reset_locators(struct ntfs_attr_search_ctx *ctx);
+void ntfs_attrlist_capture_exact(struct ntfs_attr_search_ctx *ctx,
+		struct ntfs_inode *base_ni, struct attr_list_entry *ale,
+		u8 *al_start);
 void ntfs_attrlist_exact_key_from_ale(struct ntfs_attrlist_exact_key *key,
 		const struct attr_list_entry *ale);
 bool ntfs_attrlist_exact_key_eq(const struct attr_list_entry *ale,

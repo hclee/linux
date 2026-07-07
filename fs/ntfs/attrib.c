@@ -38,7 +38,7 @@ void ntfs_attrlist_reset_locators(struct ntfs_attr_search_ctx *ctx)
 	ctx->used_attrlist = false;
 }
 
-static void ntfs_attrlist_capture_exact(struct ntfs_attr_search_ctx *ctx,
+void ntfs_attrlist_capture_exact(struct ntfs_attr_search_ctx *ctx,
 		struct ntfs_inode *base_ni, struct attr_list_entry *ale,
 		u8 *al_start)
 {

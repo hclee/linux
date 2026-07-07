@@ -3341,11 +3341,14 @@ static int ntfs_attr_position(__le32 type, struct ntfs_attr_search_ctx *ctx)
 				(base_ni->attr_list + ctx->al_insert.off);
 
 			if (MREF_LE(ale->mft_reference) != ctx->ntfs_ino->mft_no) {
-			ntfs_attr_reinit_search_ctx(ctx);
-			err = ntfs_attr_lookup(atype, NULL, 0, CASE_SENSITIVE, 0, NULL,
-					       0, ctx);
-			if (err)
-				return err;
+				ntfs_attr_reinit_search_ctx(ctx);
+				err = ntfs_attr_lookup(atype, NULL, 0, CASE_SENSITIVE, 0, NULL,
+						       0, ctx);
+				if (err)
+					return err;
+			} else {
+				ntfs_attrlist_capture_exact(ctx, base_ni, ale,
+							 base_ni->attr_list);
 			}
 		}
 	}
