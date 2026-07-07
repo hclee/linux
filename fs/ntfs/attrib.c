@@ -88,7 +88,7 @@ bool ntfs_attrlist_exact_key_eq(const struct attr_list_entry *ale,
 		       ale->name_length * sizeof(key->name[0]));
 }
 
-static struct attr_list_entry *ntfs_attrlist_find_exact_locked(
+struct attr_list_entry *ntfs_attrlist_find_exact_locked(
 		struct ntfs_inode *base_ni,
 		struct ntfs_attrlist_exact *exact)
 {
