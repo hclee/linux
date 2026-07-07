@@ -217,7 +217,8 @@ retry_lookup:
 		}
 		entry_offset = (u8 *)ale - ni->attr_list + le16_to_cpu(ale->length);
 	} else {
-		if (ctx->al_insert.gen != ni->attr_list_gen) {
+		if (!ctx->al_insert.valid ||
+		    ctx->al_insert.gen != ni->attr_list_gen) {
 			up_write(&ni->attr_list_lock);
 			ntfs_attr_put_search_ctx(ctx);
 			goto retry_lookup;
@@ -270,6 +271,7 @@ retry_lookup:
 		ni->attr_list_gen++;
 		up_write(&ni->attr_list_lock);
 		kvfree(new_al);
+		new_al = NULL;
 		goto err_out;
 	}
 	kvfree(old_al);

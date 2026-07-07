@@ -1353,8 +1353,10 @@ static int ntfs_external_attr_find(const __le32 type,
 find_attr_list_attr:
 
 			/* Check for bogus calls. */
-			if (name || name_len || val || val_len || lowest_vcn)
-				return -EINVAL;
+			if (name || name_len || val || val_len || lowest_vcn) {
+				err = -EINVAL;
+				goto unlock_list_attr;
+			}
 
 			/* We want the base record. */
 			if (ctx->ntfs_ino != base_ni)
@@ -1381,17 +1383,17 @@ find_attr_list_attr:
 			ctx->al_cursor.valid = true;
 			ctx->is_first = true;
 
-			/* Got it. Done. */
 			if (!err)
-				return 0;
+				goto unlock_list_attr;
 
 			/* Error! If other than not found return it. */
 			if (err != -ENOENT)
-				return err;
+				goto unlock_list_attr;
 
 			/* Not found?!? Absurd! */
 			ntfs_error(ctx->ntfs_ino->vol->sb, "Attribute list wasn't found");
-			return -EIO;
+			err = -EIO;
+			goto unlock_list_attr;
 		}
 	}
 	for (;; al_entry = next_al_entry) {
@@ -1614,6 +1616,10 @@ do_next_attr:
 		a = (struct attr_record *)((u8 *)a + attr_len);
 		goto do_next_attr_loop;
 	}
+
+unlock_list_attr:
+	up_read(&base_ni->attr_list_lock);
+	return err;
 
 corrupt:
 	if (ni != base_ni) {
