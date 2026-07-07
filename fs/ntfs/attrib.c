@@ -2778,6 +2778,8 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 		if (NInoAttrList(base_ni) && base_ni->attr_list)
 			kvfree(base_ni->attr_list);
 		base_ni->attr_list = NULL;
+		base_ni->attr_list_size = 0;
+		base_ni->attr_list_gen++;
 		NInoClearAttrList(base_ni);
 	}
 

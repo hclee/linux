@@ -3125,6 +3125,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	/* Set in-memory attribute list. */
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
 
 	attr_al_len = offsetof(struct attr_record, data.resident.reserved) + 1 +
@@ -3159,6 +3160,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 remove_attrlist_record:
 	/* Prevent ntfs_attr_recorm_rm from freeing attribute list. */
 	ni->attr_list = NULL;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
 	/* Remove $ATTRIBUTE_LIST record. */
 	ntfs_attr_reinit_search_ctx(ctx);
@@ -3173,6 +3175,7 @@ remove_attrlist_record:
 	/* Setup back in-memory runlist. */
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
 rollback:
 	/*
@@ -3202,6 +3205,7 @@ rollback:
 	/* Remove in-memory attribute list. */
 	ni->attr_list = NULL;
 	ni->attr_list_size = 0;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
 	NInoClearAttrListDirty(ni);
 put_err_out:
