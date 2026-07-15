@@ -3618,9 +3618,7 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
 		struct attr_list_entry *ale;
 
 		down_write(&base_ni->attr_list_lock);
-		ale = ntfs_attrlist_find_ctx_ale_locked(base_ni, ctx);
-		if (!ale)
-			ale = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
+		ale = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
 		if (!ale) {
 			up_write(&base_ni->attr_list_lock);
 			unmap_mft_record(ni);
