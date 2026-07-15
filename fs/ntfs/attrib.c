@@ -4067,7 +4067,10 @@ retry:
 			ale->lowest_vcn = cpu_to_le64(stop_vcn);
 			base_ni->attr_list_gen++;
 			ntfs_attrlist_capture_exact(ctx, base_ni, ale,
-						 base_ni->attr_list);
+					 base_ni->attr_list);
+			ctx->al_cursor.off = (u8 *)ale - base_ni->attr_list;
+			ctx->al_cursor.gen = base_ni->attr_list_gen;
+			ctx->al_cursor.valid = true;
 			up_write(&base_ni->attr_list_lock);
 
 			/* Update lowest vcn in attr record after ALE is fixed. */
@@ -4099,7 +4102,6 @@ retry:
 		a->data.non_resident.highest_vcn = cpu_to_le64(stop_vcn - 1);
 		mark_mft_record_dirty(ctx->ntfs_ino);
 		de_cluster_count += de_cnt;
-		from_vcn = stop_vcn;
 	}
 
 	/* Check whether error occurred. */
