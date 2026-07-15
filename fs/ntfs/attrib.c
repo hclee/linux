@@ -3880,7 +3880,7 @@ int ntfs_attr_update_mapping_pairs(struct ntfs_inode *ni, s64 from_vcn)
 	struct attr_record *a;
 	s64 stop_vcn;
 	int err = 0, mp_size, cur_max_mp_size, exp_max_mp_size;
-	bool finished_build;
+	bool finished_build, attrlist_changed = false;
 	bool first_updated = false;
 	struct super_block *sb;
 	struct runlist_element *start_rl;
@@ -3917,7 +3917,6 @@ retry:
 	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
 				CASE_SENSITIVE, from_vcn, NULL, 0, ctx))) {
 		unsigned int de_cnt = 0;
-		bool update_attrlist;
 
 		a = ctx->attr;
 		m = ctx->mrec;
@@ -4044,9 +4043,7 @@ retry:
 			}
 		}
 
-		update_attrlist = ctx->used_attrlist &&
-				  ctx->attr->type != AT_ATTRIBUTE_LIST;
-		if (update_attrlist) {
+		if (ctx->used_attrlist && ctx->attr->type != AT_ATTRIBUTE_LIST) {
 			struct attr_list_entry *ale;
 
 			/*
@@ -4070,6 +4067,10 @@ retry:
 			base_ni->attr_list_gen++;
 			ntfs_attrlist_capture_exact(ctx, base_ni, ale,
 					 base_ni->attr_list);
+			ctx->al_cursor.off = (u8 *)ale - base_ni->attr_list;
+			ctx->al_cursor.gen = base_ni->attr_list_gen;
+			ctx->al_cursor.valid = true;
+			attrlist_changed = true;
 			up_write(&base_ni->attr_list_lock);
 
 			/* Update lowest vcn in attr record after ALE is fixed. */
@@ -4099,15 +4100,6 @@ retry:
 		mark_mft_record_dirty(ctx->ntfs_ino);
 		de_cluster_count += de_cnt;
 
-		if (update_attrlist) {
-			err = ntfs_attrlist_update(base_ni);
-			if (err)
-				goto put_err_out;
-			if (finished_build)
-				break;
-			ntfs_attr_reinit_search_ctx(ctx);
-			from_vcn = stop_vcn;
-		}
 	}
 
 	/* Check whether error occurred. */
@@ -4138,6 +4130,12 @@ retry:
 			ntfs_error(sb, "Failed to update sizes in base extent\n");
 			goto put_err_out;
 		}
+	}
+
+	if (attrlist_changed) {
+		err = ntfs_attrlist_update(base_ni);
+		if (err)
+			goto put_err_out;
 	}
 
 	/* Deallocate not used attribute extents and return with success. */
