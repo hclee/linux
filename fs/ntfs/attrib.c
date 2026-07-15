@@ -1275,6 +1275,7 @@ static int ntfs_external_attr_find(const __le32 type,
 	u32 al_name_len;
 	u32 attr_len, mft_free_len;
 	bool is_first_search = false;
+	bool attr_list_locked = true;
 	int err = 0;
 	static const char *es = " Unmount and run chkdsk.";
 
@@ -1397,6 +1398,7 @@ find_attr_list_attr:
 		}
 	}
 	for (;; al_entry = next_al_entry) {
+scan_ale:
 		/* Out of bounds check. */
 		if ((u8 *)al_entry < base_ni->attr_list ||
 				(u8 *)al_entry > al_end)
@@ -1492,8 +1494,21 @@ find_attr_list_attr:
 			continue;
 
 is_enumeration:
-		if (MREF_LE(al_entry->mft_reference) == ni->mft_no) {
-			if (MSEQNO_LE(al_entry->mft_reference) != ni->seq_no) {
+		/*
+		 * The extent mapping below takes extent_lock.  Keep only a
+		 * stable copy of this ALE while taking it, so the attr-list
+		 * read lock never nests outside extent_lock.
+		 */
+		ntfs_attrlist_capture_exact(ctx, base_ni, al_entry, al_start);
+		al_name = ctx->al_exact.key.name;
+		al_name_len = ctx->al_exact.key.name_len;
+		if (attr_list_locked)
+			up_read(&base_ni->attr_list_lock);
+		attr_list_locked = false;
+
+		if (MREF_LE(ctx->al_exact.key.mft_reference) == ni->mft_no) {
+			if (MSEQNO_LE(ctx->al_exact.key.mft_reference) !=
+			    ni->seq_no) {
 				ntfs_error(vol->sb,
 					"Found stale mft reference in attribute list of base inode 0x%llx.%s",
 					base_ni->mft_no, es);
@@ -1505,7 +1520,7 @@ is_enumeration:
 			if (ni != base_ni)
 				unmap_extent_mft_record(ni);
 			/* Do we want the base record back? */
-			if (MREF_LE(al_entry->mft_reference) ==
+			if (MREF_LE(ctx->al_exact.key.mft_reference) ==
 					base_ni->mft_no) {
 				ni = ctx->ntfs_ino = base_ni;
 				ctx->mrec = ctx->base_mrec;
@@ -1514,11 +1529,12 @@ is_enumeration:
 				/* We want an extent record. */
 				ctx->mrec = map_extent_mft_record(base_ni,
 						le64_to_cpu(
-						al_entry->mft_reference), &ni);
+						ctx->al_exact.key.mft_reference),
+						&ni);
 				if (IS_ERR(ctx->mrec)) {
 					ntfs_error(vol->sb,
 							"Failed to map extent mft record 0x%lx of base inode 0x%llx.%s",
-							MREF_LE(al_entry->mft_reference),
+							MREF_LE(ctx->al_exact.key.mft_reference),
 							base_ni->mft_no, es);
 					err = PTR_ERR(ctx->mrec);
 					if (err == -ENOENT)
@@ -1561,8 +1577,19 @@ do_next_attr_loop:
 
 		mft_free_len = le32_to_cpu(ctx->mrec->bytes_in_use) -
 			       ((u8 *)a - (u8 *)ctx->mrec);
-		if (mft_free_len >= sizeof(a->type) && a->type == AT_END)
-			continue;
+		if (mft_free_len >= sizeof(a->type) && a->type == AT_END) {
+			down_read(&base_ni->attr_list_lock);
+			attr_list_locked = true;
+			al_start = base_ni->attr_list;
+			al_end = al_start + base_ni->attr_list_size;
+			al_entry = ntfs_attrlist_find_exact_locked(base_ni,
+								 &ctx->al_exact);
+			if (!al_entry)
+				goto corrupt;
+			al_entry = (struct attr_list_entry *)((u8 *)al_entry +
+					le16_to_cpu(al_entry->length));
+			goto scan_ale;
+		}
 
 		attr_len = le32_to_cpu(a->length);
 		if (!attr_len ||
@@ -1571,14 +1598,14 @@ do_next_attr_loop:
 		    attr_len > mft_free_len)
 			break;
 
-		if (al_entry->instance != a->instance)
+		if (ctx->al_exact.key.instance != a->instance)
 			goto do_next_attr;
 		/*
 		 * If the type and/or the name are mismatched between the
 		 * attribute list entry and the attribute record, there is
 		 * corruption so we break and return error EIO.
 		 */
-		if (al_entry->type != a->type)
+		if (ctx->al_exact.key.type != a->type)
 			break;
 		if (a->name_length && ((le16_to_cpu(a->name_offset) +
 			       a->name_length * sizeof(__le16)) > attr_len))
@@ -1607,9 +1634,6 @@ do_next_attr_loop:
 			if (value_length == val_len &&
 			    !memcmp((u8 *)a + value_offset, val, val_len)) {
 attr_found:
-				ntfs_attrlist_capture_exact(ctx, base_ni, al_entry,
-					al_start);
-				up_read(&base_ni->attr_list_lock);
 				ntfs_debug("Done, found.");
 				return 0;
 			}
@@ -1621,7 +1645,8 @@ do_next_attr:
 	}
 
 unlock_list_attr:
-	up_read(&base_ni->attr_list_lock);
+	if (attr_list_locked)
+		up_read(&base_ni->attr_list_lock);
 	return err;
 
 corrupt:
@@ -1647,13 +1672,15 @@ corrupt:
 		err = -EIO;
 	}
 
-	up_read(&base_ni->attr_list_lock);
+	if (attr_list_locked)
+		up_read(&base_ni->attr_list_lock);
 	if (err != -ENOMEM)
 		NVolSetErrors(vol);
 	return err;
 not_found:
 	ntfs_attrlist_capture_insert(ctx, base_ni, al_entry, al_start, al_end);
-	up_read(&base_ni->attr_list_lock);
+	if (attr_list_locked)
+		up_read(&base_ni->attr_list_lock);
 	/*
 	 * If we were looking for AT_END, we reset the search context @ctx and
 	 * use ntfs_attr_find() to seek to the end of the base mft record.
@@ -2772,12 +2799,11 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	 */
 	ntfs_attr_reinit_search_ctx(ctx);
 	err = ntfs_attr_lookup(type, name, name_len, CASE_SENSITIVE,
-				lowest_vcn, NULL, 0, ctx);
+			lowest_vcn, NULL, 0, ctx);
 	if (err) {
 		pr_err("%s: attribute lookup failed\n", __func__);
 		ntfs_attr_put_search_ctx(ctx);
 		return err;
-
 	}
 	offset = (u8 *)ctx->attr - (u8 *)ctx->mrec;
 	ntfs_attr_put_search_ctx(ctx);
