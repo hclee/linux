@@ -4,7 +4,7 @@
 set -eu
 
 if [ "$#" -eq 0 ]; then
-	echo "Usage: $0 {build_kernel|find|ls|chmod|git|sed|reset_test_ntfs|restart_vm|run_xfstests|validate_guest_runner|validate_vm_manager} [arguments...]" >&2
+	echo "Usage: $0 {build_kernel|find|ls|chmod|git|sed|reset_test_ntfs|restart_vm|run_xfstests|repeat_xfstests|validate_guest_runner|validate_vm_manager} [arguments...]" >&2
 	exit 64
 fi
 
@@ -24,6 +24,27 @@ find|ls|chmod|git|sed)
 	;;
 run_xfstests)
 	exec /home/hyunchul/qemu-linux/vm_manager.sh run_xfstests "$@"
+	;;
+repeat_xfstests)
+	if [ "$#" -ne 3 ]; then
+		echo "Usage: $0 repeat_xfstests <fstype> <test> <count>" >&2
+		exit 64
+	fi
+	case "$3" in
+	''|*[!0-9]*|0)
+		echo "run_wrapper.sh: count must be a positive integer" >&2
+		exit 64
+		;;
+	esac
+	i=1
+	while [ "$i" -le "$3" ]; do
+		"$0" git diff --check
+		"$0" build_kernel
+		"$0" restart_vm
+		"$0" reset_test_ntfs
+		"$0" run_xfstests "$1" "$2"
+		i=$((i + 1))
+	done
 	;;
 restart_vm)
 	if [ "$#" -ne 0 ]; then
