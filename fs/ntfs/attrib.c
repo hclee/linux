@@ -118,56 +118,6 @@ struct attr_list_entry *ntfs_attrlist_find_exact_locked(
 	return NULL;
 }
 
-static struct attr_list_entry *ntfs_attrlist_find_ctx_ale_locked(
-		struct ntfs_inode *base_ni,
-		struct ntfs_attr_search_ctx *ctx)
-{
-	struct attr_list_entry *ale;
-	u8 *al_end;
-	struct attr_record *a = ctx->attr;
-	__le16 *name;
-	__le64 lowest_vcn;
-	__le64 mref;
-
-	if (!a || !base_ni->attr_list)
-		return NULL;
-
-	if (a->name_length)
-		name = (__le16 *)((u8 *)a + le16_to_cpu(a->name_offset));
-	else
-		name = AT_UNNAMED;
-
-	if (a->non_resident)
-		lowest_vcn = a->data.non_resident.lowest_vcn;
-	else
-		lowest_vcn = 0;
-
-	mref = MK_LE_MREF(ctx->ntfs_ino->mft_no, ctx->ntfs_ino->seq_no);
-	al_end = base_ni->attr_list + base_ni->attr_list_size;
-
-	for (ale = (struct attr_list_entry *)base_ni->attr_list;
-	     ntfs_attr_list_entry_is_valid(ale, al_end);
-	     ale = (struct attr_list_entry *)((u8 *)ale +
-		     le16_to_cpu(ale->length))) {
-		if (ale->type != a->type)
-			continue;
-		if (ale->instance != a->instance)
-			continue;
-		if (ale->mft_reference != mref)
-			continue;
-		if (ale->lowest_vcn != lowest_vcn)
-			continue;
-		if (ale->name_length != a->name_length)
-			continue;
-		if (a->name_length && memcmp(ale->name, name,
-			    a->name_length * sizeof(__le16)))
-			continue;
-		return ale;
-	}
-
-	return NULL;
-}
-
 static struct ntfs_inode *ntfs_attr_ctx_base_ni(struct ntfs_attr_search_ctx *ctx)
 {
 	if (ctx->ntfs_ino->nr_extents == -1)
