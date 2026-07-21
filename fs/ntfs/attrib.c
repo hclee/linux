@@ -3949,9 +3949,16 @@ retry:
 	else
 		base_ni = ni;
 
+	if (NInoAttrList(base_ni) && ni->type != AT_ATTRIBUTE_LIST) {
+		mutex_lock(&base_ni->attr_list_persist_lock);
+		attrlist_locked = true;
+	}
+
 	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx) {
 		ntfs_error(sb, "%s: Failed to get search context", __func__);
+		if (attrlist_locked)
+			mutex_unlock(&base_ni->attr_list_persist_lock);
 		return -ENOMEM;
 	}
 
@@ -4020,16 +4027,6 @@ retry:
 			a->data.non_resident.highest_vcn = cpu_to_le64(NTFS_VCN_DELETE_MARK);
 			mark_mft_record_dirty(ctx->ntfs_ino);
 			continue;
-		}
-
-		/*
-		 * Serialize every possible ALE update in this iteration with
-		 * the subsequent attribute-list persistence.
-		 */
-		if (NInoAttrList(base_ni) &&
-		    ni->type != AT_ATTRIBUTE_LIST && !attrlist_locked) {
-			mutex_lock(&base_ni->attr_list_persist_lock);
-			attrlist_locked = true;
 		}
 
 		err = ntfs_attr_update_meta(a, ni, m, ctx);
