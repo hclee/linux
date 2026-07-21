@@ -4119,16 +4119,12 @@ retry:
 			struct attr_list_entry *ale;
 
 			/*
-			 * Look up the ALE before updating the attr record's
-			 * lowest_vcn.  ntfs_attrlist_find_ctx_ale_locked()
-			 * matches ale->lowest_vcn against the current value in
-			 * the attr record; updating the attr record first would
-			 * always cause a mismatch.
+			 * ctx->al_exact identifies the ALE selected by
+			 * ntfs_attr_lookup().  Update it before changing the
+			 * attr record's lowest_vcn.
 			 */
 			down_write(&base_ni->attr_list_lock);
-			ale = ntfs_attrlist_find_ctx_ale_locked(base_ni, ctx);
-			if (!ale)
-				ale = ntfs_attrlist_find_exact_locked(base_ni,
+			ale = ntfs_attrlist_find_exact_locked(base_ni,
 						     &ctx->al_exact);
 			if (!ale) {
 				up_write(&base_ni->attr_list_lock);
