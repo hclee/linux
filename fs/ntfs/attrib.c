@@ -3884,6 +3884,24 @@ out:
  * call to this function. Vice-versa @na->compressed_size will be calculated and
  * set to correct value during this function.
  */
+static bool ntfs_attr_ctx_matches_ni(const struct ntfs_attr_search_ctx *ctx,
+				     const struct ntfs_inode *ni)
+{
+	const struct attr_record *a = ctx->attr;
+	const __le16 *name;
+
+	if (a->type != ni->type || a->name_length != ni->name_len)
+		return false;
+	if (!a->name_length)
+		return true;
+
+	name = (const __le16 *)((const u8 *)a +
+			le16_to_cpu(a->name_offset));
+	return ntfs_are_names_equal(name, a->name_length, ni->name,
+			ni->name_len, CASE_SENSITIVE, ni->vol->upcase,
+			ni->vol->upcase_len);
+}
+
 int ntfs_attr_update_mapping_pairs(struct ntfs_inode *ni, s64 from_vcn)
 {
 	struct ntfs_attr_search_ctx *ctx;
@@ -3892,11 +3910,12 @@ int ntfs_attr_update_mapping_pairs(struct ntfs_inode *ni, s64 from_vcn)
 	struct attr_record *a;
 	s64 stop_vcn;
 	int err = 0, mp_size, cur_max_mp_size, exp_max_mp_size;
-	bool finished_build;
+	bool finished_build, attrlist_changed = false;
 	bool first_updated = false;
 	struct super_block *sb;
 	struct runlist_element *start_rl;
 	unsigned int de_cluster_count = 0;
+	bool first_lookup = true;
 
 retry:
 	if (!ni || !ni->runlist.rl)
@@ -3925,10 +3944,23 @@ retry:
 	/* Fill attribute records with new mapping pairs. */
 	stop_vcn = 0;
 	finished_build = false;
+	first_lookup = true;
 	start_rl = ni->runlist.rl;
-	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, from_vcn, NULL, 0, ctx))) {
+	while (1) {
 		unsigned int de_cnt = 0;
+
+		if (first_lookup) {
+			err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+					CASE_SENSITIVE, from_vcn, NULL, 0, ctx);
+			first_lookup = false;
+		} else {
+			err = ntfs_attr_lookup(AT_UNUSED, NULL, 0,
+					CASE_SENSITIVE, 0, NULL, 0, ctx);
+		}
+		if (err)
+			break;
+		if (!ntfs_attr_ctx_matches_ni(ctx, ni))
+			continue;
 
 		a = ctx->attr;
 		m = ctx->mrec;
@@ -4055,13 +4087,21 @@ retry:
 			}
 		}
 
-		/* Update lowest vcn. */
-		a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
-		mark_mft_record_dirty(ctx->ntfs_ino);
-		if ((ctx->ntfs_ino->nr_extents == -1 || NInoAttrList(ctx->ntfs_ino)) &&
-		    ctx->attr->type != AT_ATTRIBUTE_LIST) {
+		/*
+		 * al_cursor.valid is true here exactly when this iteration's
+		 * ntfs_attr_lookup() went through ntfs_external_attr_find()
+		 * (see the al_cursor doc comment in attrib.h): that function
+		 * makes it true, unconditionally and with no early return in
+		 * between, before returning success.
+		 */
+		if (ctx->al_cursor.valid && ctx->attr->type != AT_ATTRIBUTE_LIST) {
 			struct attr_list_entry *ale;
 
+			/*
+			 * ctx->al_exact identifies the ALE selected by
+			 * ntfs_attr_lookup().  Update it before changing the
+			 * attr record's lowest_vcn.
+			 */
 			down_write(&base_ni->attr_list_lock);
 			ale = ntfs_attrlist_find_exact_locked(base_ni,
 						     &ctx->al_exact);
@@ -4073,11 +4113,21 @@ retry:
 			ale->lowest_vcn = cpu_to_le64(stop_vcn);
 			base_ni->attr_list_gen++;
 			ntfs_attrlist_capture_exact(ctx, base_ni, ale,
-						 base_ni->attr_list);
+					 base_ni->attr_list);
+			ctx->al_cursor.off = (u8 *)ale - base_ni->attr_list;
+			ctx->al_cursor.gen = base_ni->attr_list_gen;
+			ctx->al_cursor.valid = true;
+			attrlist_changed = true;
 			up_write(&base_ni->attr_list_lock);
-			err = ntfs_attrlist_update(base_ni);
-			if (err)
-				goto put_err_out;
+
+			/* Update lowest vcn in attr record after ALE is fixed. */
+			a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
+			mark_mft_record_dirty(ctx->ntfs_ino);
+
+		} else {
+			/* Update lowest vcn. */
+			a->data.non_resident.lowest_vcn = cpu_to_le64(stop_vcn);
+			mark_mft_record_dirty(ctx->ntfs_ino);
 		}
 
 		/*
@@ -4096,6 +4146,7 @@ retry:
 		a->data.non_resident.highest_vcn = cpu_to_le64(stop_vcn - 1);
 		mark_mft_record_dirty(ctx->ntfs_ino);
 		de_cluster_count += de_cnt;
+
 	}
 
 	/* Check whether error occurred. */
@@ -4128,12 +4179,20 @@ retry:
 		}
 	}
 
+	if (attrlist_changed) {
+		err = ntfs_attrlist_update(base_ni);
+		if (err)
+			goto put_err_out;
+	}
+
 	/* Deallocate not used attribute extents and return with success. */
 	if (finished_build) {
 		ntfs_attr_reinit_search_ctx(ctx);
 		ntfs_debug("Deallocate marked extents.\n");
-		while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+		while (!(err = ntfs_attr_lookup(AT_UNUSED, NULL, 0,
 				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
+			if (!ntfs_attr_ctx_matches_ni(ctx, ni))
+				continue;
 			if (le64_to_cpu(ctx->attr->data.non_resident.highest_vcn) !=
 					NTFS_VCN_DELETE_MARK)
 				continue;
