@@ -3054,14 +3054,20 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 
 	ntfs_debug("inode %llu\n", ni->mft_no);
 
+	/* Serialize the initial state check and attribute-list publication. */
+	mutex_lock(&ni->attr_list_persist_lock);
+
 	if (NInoAttrList(ni) || ni->nr_extents) {
 		ntfs_error(ni->vol->sb, "Inode already has attribute list");
-		return -EEXIST;
+		err = -EEXIST;
+		goto out_unlock;
 	}
 
 	ni_mrec = map_mft_record(ni);
-	if (IS_ERR(ni_mrec))
-		return -EIO;
+	if (IS_ERR(ni_mrec)) {
+		err = -EIO;
+		goto out_unlock;
+	}
 
 	/* Form attribute list. */
 	ctx = ntfs_attr_get_search_ctx(ni, ni_mrec);
@@ -3123,9 +3129,12 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	}
 
 	/* Set in-memory attribute list. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
+	up_write(&ni->attr_list_lock);
 
 	attr_al_len = offsetof(struct attr_record, data.resident.reserved) + 1 +
 		((al_len + 7) & ~7);
@@ -3151,29 +3160,35 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	err = ntfs_attrlist_update_locked(ni);
 	if (err < 0)
 		goto remove_attrlist_record;
-
+	mutex_unlock(&ni->attr_list_persist_lock);
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(ni);
 	return 0;
 
 remove_attrlist_record:
-	/* Prevent ntfs_attr_recorm_rm from freeing attribute list. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = NULL;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
+	up_write(&ni->attr_list_lock);
+
 	/* Remove $ATTRIBUTE_LIST record. */
 	ntfs_attr_reinit_search_ctx(ctx);
 	if (!ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0,
 				CASE_SENSITIVE, 0, NULL, 0, ctx)) {
-		if (ntfs_attr_record_rm(ctx))
+		if (ntfs_attr_record_rm(ctx, true))
 			ntfs_error(ni->vol->sb, "Rollback failed to remove attrlist");
 	} else {
 		ntfs_error(ni->vol->sb, "Rollback failed to find attrlist");
 	}
 
 	/* Setup back in-memory runlist. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
+	up_write(&ni->attr_list_lock);
 rollback:
 	/*
 	 * Scan attribute list for attributes that placed not in the base MFT
@@ -3200,15 +3215,21 @@ rollback:
 	}
 
 	/* Remove in-memory attribute list. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = NULL;
 	ni->attr_list_size = 0;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
 	NInoClearAttrListDirty(ni);
+	up_write(&ni->attr_list_lock);
+
 put_err_out:
 	ntfs_attr_put_search_ctx(ctx);
 err_out:
 	kvfree(al);
 	unmap_mft_record(ni);
+out_unlock:
+	mutex_unlock(&ni->attr_list_persist_lock);
 	return err;
 }
 

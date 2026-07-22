@@ -118,23 +118,6 @@ int ntfs_attrlist_update_locked(struct ntfs_inode *base_ni)
 }
 
 /*
- * ntfs_attrlist_update - persist the in-memory attribute list to disk
- * @base_ni:	base ntfs inode containing the attribute list
- *
- * Serialize the persist against concurrent attribute-list replacement
- * transactions.
- */
-int ntfs_attrlist_update(struct ntfs_inode *base_ni)
-{
-	int err;
-
-	mutex_lock(&base_ni->attr_list_persist_lock);
-	err = ntfs_attrlist_update_locked(base_ni);
-	mutex_unlock(&base_ni->attr_list_persist_lock);
-	return err;
-}
-
-/*
  * ntfs_attrlist_entry_add - add an attribute list attribute entry
  * @ni:	opened ntfs inode, which contains that attribute
  * @attr: attribute record to add to attribute list
@@ -328,7 +311,7 @@ err_out:
  *
  * Return 0 on success and -errno on error.
  */
-int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
+int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 {
 	u8 *new_al = NULL;
 	int err, new_al_len;
@@ -356,7 +339,7 @@ int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
 		ntfs_debug("Attribute list isn't present.\n");
 		return -ENOENT;
 	}
-	mutex_lock(&base_ni->attr_list_persist_lock);
+	lockdep_assert_held(&base_ni->attr_list_persist_lock);
 
 	/*
 	 * Another thread may have removed the attribute list while we were
@@ -414,6 +397,19 @@ int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
 	kvfree(old_al);
 	err = 0;
 out_unlock:
+	return err;
+}
+
+int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
+{
+	struct ntfs_inode *base_ni;
+	int err;
+
+	if (!ctx || !ctx->ntfs_ino)
+		return -EINVAL;
+	base_ni = ctx->base_ntfs_ino ? ctx->base_ntfs_ino : ctx->ntfs_ino;
+	mutex_lock(&base_ni->attr_list_persist_lock);
+	err = ntfs_attrlist_entry_rm_locked(ctx);
 	mutex_unlock(&base_ni->attr_list_persist_lock);
 	return err;
 }
