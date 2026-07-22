@@ -2816,10 +2816,43 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 
 	/* Post $ATTRIBUTE_LIST delete setup. */
 	if (type == AT_ATTRIBUTE_LIST) {
+		/*
+		 * attr_list_persist_lock serializes this in-memory attr_list
+		 * teardown against a concurrent ntfs_attrlist_entry_add()/rm()
+		 * transaction on the same inode.  Those functions publish a
+		 * replacement buffer under attr_list_lock, then release
+		 * attr_list_lock while they call ntfs_attrlist_update() (which
+		 * can sleep) and, on failure, roll back to their old buffer.
+		 * Without attr_list_persist_lock here, this teardown could run
+		 * during that window: it would kvfree() a buffer a pending
+		 * ntfs_attrlist_entry_add()/rm() still owns, and that mutation
+		 * would then report success or roll back into a buffer nobody
+		 * else knows was freed.
+		 *
+		 * attr_list_lock protects the in-memory attribute list state
+		 * (attr_list, attr_list_size and attr_list_gen).  The caller
+		 * holds mrec_lock for the MFT record being modified, so the
+		 * lock order here is mrec_lock -> attr_list_persist_lock ->
+		 * attr_list_lock.  This is the same order used by
+		 * ntfs_attrlist_entry_add()/rm(), with attr_list_lock being
+		 * the innermost lock in the attr-list locking hierarchy.
+		 *
+		 * Callers that already hold attr_list_persist_lock for this
+		 * inode (there are none at the time of writing) must release
+		 * it before recursing into ntfs_attr_record_rm() with an
+		 * AT_ATTRIBUTE_LIST context, exactly as they already must
+		 * release attr_list_lock before doing so.
+		 */
+		mutex_lock(&base_ni->attr_list_persist_lock);
+		down_write(&base_ni->attr_list_lock);
 		if (NInoAttrList(base_ni) && base_ni->attr_list)
 			kvfree(base_ni->attr_list);
 		base_ni->attr_list = NULL;
+		base_ni->attr_list_size = 0;
+		base_ni->attr_list_gen++;
 		NInoClearAttrList(base_ni);
+		up_write(&base_ni->attr_list_lock);
+		mutex_unlock(&base_ni->attr_list_persist_lock);
 	}
 
 	/* Free MFT record, if it doesn't contain attributes. */

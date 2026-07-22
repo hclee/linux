@@ -3049,6 +3049,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	struct attr_list_entry *ale = NULL;
 	struct mft_record *ni_mrec;
 	u32 attr_al_len;
+	bool attrlist_locked = false;
 
 	if (!ni)
 		return -EINVAL;
@@ -3123,10 +3124,37 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 		goto put_err_out;
 	}
 
-	/* Set in-memory attribute list. */
+	/*
+	 * From this point on, @ni is published as having an attribute list
+	 * (NInoSetAttrList() below) before that list has actually been
+	 * persisted to disk.  A concurrent ntfs_attrlist_entry_add()/rm()
+	 * targeting an extent of @ni only needs to observe NInoAttrList(ni);
+	 * it does not need @ni's own mrec_lock (which this function holds
+	 * for its whole run via the map_mft_record() above), so mrec_lock
+	 * alone does not serialize against it here.  Hold
+	 * attr_list_persist_lock across the publish, the disk-touching
+	 * ntfs_attrlist_update() call and the failure rollback below, so
+	 * such a concurrent mutation cannot publish or free a buffer while
+	 * this function's own buffer is in flight.  This mirrors the
+	 * publish/persist/rollback transaction in
+	 * ntfs_attrlist_entry_add()/rm().  We must still release this lock
+	 * before calling ntfs_attr_record_rm() further down, because that
+	 * function acquires attr_list_persist_lock itself for its
+	 * AT_ATTRIBUTE_LIST teardown.
+	 *
+	 * Set in-memory attribute list.  attr_list_lock protects the
+	 * in-memory attribute list state.  We hold mrec_lock for @ni, so
+	 * the lock order is mrec_lock -> attr_list_persist_lock ->
+	 * attr_list_lock, consistent with the attr-list locking hierarchy.
+	 */
+	mutex_lock(&ni->attr_list_persist_lock);
+	attrlist_locked = true;
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
+	up_write(&ni->attr_list_lock);
 
 	attr_al_len = offsetof(struct attr_record, data.resident.reserved) + 1 +
 		((al_len + 7) & ~7);
@@ -3153,14 +3181,38 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	if (err < 0)
 		goto remove_attrlist_record;
 
+	mutex_unlock(&ni->attr_list_persist_lock);
+	attrlist_locked = false;
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(ni);
 	return 0;
 
 remove_attrlist_record:
-	/* Prevent ntfs_attr_recorm_rm from freeing attribute list. */
+	/*
+	 * Prevent ntfs_attr_record_rm() from freeing the attribute list.  We
+	 * must drop attr_list_lock before calling ntfs_attr_record_rm() and
+	 * before the rollback loop below, because both of those paths acquire
+	 * attr_list_lock themselves.
+	 */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = NULL;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
+	up_write(&ni->attr_list_lock);
+
+	/*
+	 * ntfs_attr_record_rm() acquires attr_list_persist_lock itself when
+	 * it tears down an AT_ATTRIBUTE_LIST record (see its "Post
+	 * $ATTRIBUTE_LIST delete setup" branch), so this lock must be
+	 * released before calling it, exactly as attr_list_lock already is
+	 * above.  NInoAttrList(ni) is false at this point (cleared just
+	 * above), so a concurrent ntfs_attrlist_entry_add()/rm() cannot
+	 * touch @ni's attribute list while we are unlocked here; it would
+	 * observe !NInoAttrList(ni) and return -ENOENT immediately.
+	 */
+	mutex_unlock(&ni->attr_list_persist_lock);
+	attrlist_locked = false;
+
 	/* Remove $ATTRIBUTE_LIST record. */
 	ntfs_attr_reinit_search_ctx(ctx);
 	if (!ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0,
@@ -3171,10 +3223,25 @@ remove_attrlist_record:
 		ntfs_error(ni->vol->sb, "Rollback failed to find attrlist");
 	}
 
+	/*
+	 * Reacquire attr_list_persist_lock before republishing @al below.
+	 * From here until the final teardown at the end of the rollback
+	 * loop, @ni->attr_list is republished as @al (NInoSetAttrList()
+	 * below) while the loop performs sleeping lookups and moves
+	 * (ntfs_attr_lookup(), ntfs_attr_record_move_to()).  Without this
+	 * lock, a concurrent ntfs_attrlist_entry_add()/rm() on the same
+	 * base inode could replace or free @al out from under this loop.
+	 */
+	mutex_lock(&ni->attr_list_persist_lock);
+	attrlist_locked = true;
+
 	/* Setup back in-memory runlist. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
+	ni->attr_list_gen++;
 	NInoSetAttrList(ni);
+	up_write(&ni->attr_list_lock);
 rollback:
 	/*
 	 * Scan attribute list for attributes that placed not in the base MFT
@@ -3201,10 +3268,19 @@ rollback:
 	}
 
 	/* Remove in-memory attribute list. */
+	down_write(&ni->attr_list_lock);
 	ni->attr_list = NULL;
 	ni->attr_list_size = 0;
+	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
 	NInoClearAttrListDirty(ni);
+	up_write(&ni->attr_list_lock);
+
+	if (attrlist_locked) {
+		mutex_unlock(&ni->attr_list_persist_lock);
+		attrlist_locked = false;
+	}
+
 put_err_out:
 	ntfs_attr_put_search_ctx(ctx);
 err_out:
