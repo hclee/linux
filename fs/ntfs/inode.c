@@ -3056,8 +3056,13 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 
 	ntfs_debug("inode %llu\n", ni->mft_no);
 
+	/* Serialize the initial state check and attribute-list publication. */
+	mutex_lock(&ni->attr_list_persist_lock);
+	attrlist_locked = true;
+
 	if (NInoAttrList(ni) || ni->nr_extents) {
 		ntfs_error(ni->vol->sb, "Inode already has attribute list");
+		mutex_unlock(&ni->attr_list_persist_lock);
 		return -EEXIST;
 	}
 
@@ -3125,8 +3130,6 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni)
 	}
 
 	/* Set in-memory attribute list. */
-	mutex_lock(&ni->attr_list_persist_lock);
-	attrlist_locked = true;
 	down_write(&ni->attr_list_lock);
 	ni->attr_list = al;
 	ni->attr_list_size = al_len;
@@ -3171,25 +3174,16 @@ remove_attrlist_record:
 	ni->attr_list_gen++;
 	NInoClearAttrList(ni);
 	up_write(&ni->attr_list_lock);
-	mutex_unlock(&ni->attr_list_persist_lock);
-	attrlist_locked = false;
 
 	/* Remove $ATTRIBUTE_LIST record. */
 	ntfs_attr_reinit_search_ctx(ctx);
 	if (!ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0,
 				CASE_SENSITIVE, 0, NULL, 0, ctx)) {
-		if (ntfs_attr_record_rm(ctx, false))
+		if (ntfs_attr_record_rm(ctx, true))
 			ntfs_error(ni->vol->sb, "Rollback failed to remove attrlist");
 	} else {
 		ntfs_error(ni->vol->sb, "Rollback failed to find attrlist");
 	}
-
-	/*
-	 * Without this lock, a concurrent ntfs_attrlist_entry_add()/rm()
-	 * could replace or free @al out from under this loop.
-	 */
-	mutex_lock(&ni->attr_list_persist_lock);
-	attrlist_locked = true;
 
 	/* Setup back in-memory runlist. */
 	down_write(&ni->attr_list_lock);
@@ -3234,7 +3228,6 @@ rollback:
 
 	if (attrlist_locked) {
 		mutex_unlock(&ni->attr_list_persist_lock);
-		attrlist_locked = false;
 	}
 
 put_err_out:
