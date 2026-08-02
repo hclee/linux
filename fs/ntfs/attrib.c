@@ -2787,6 +2787,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 	struct ntfs_inode *base_ni, *ni;
 	__le32 type;
 	int err;
+	bool attrlist_locked = persist_locked;
 
 	if (!ctx || !ctx->ntfs_ino || !ctx->mrec || !ctx->attr)
 		return -EINVAL;
@@ -2801,10 +2802,18 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 	else
 		base_ni = ctx->ntfs_ino;
 
+	/* Keep ALE removal and the follow-up need check in one transaction. */
+	if (!attrlist_locked && type != AT_ATTRIBUTE_LIST &&
+	    NInoAttrList(base_ni)) {
+		mutex_lock(&base_ni->attr_list_persist_lock);
+		attrlist_locked = true;
+	}
+
 	/* Remove attribute itself. */
 	if (ntfs_attr_record_resize(ctx->mrec, ctx->attr, 0)) {
 		ntfs_debug("Couldn't remove attribute record. Bug or damaged MFT record.\n");
-		return -EIO;
+		err = -EIO;
+		goto out_unlock;
 	}
 	mark_mft_record_dirty(ni);
 
@@ -2813,10 +2822,10 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 	 * delete $ATTRIBUTE_LIST itself.
 	 */
 	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
-		err = ntfs_attrlist_entry_rm(ctx);
+		err = ntfs_attrlist_entry_rm_locked(ctx);
 		if (err) {
 			ntfs_debug("Couldn't delete record from $ATTRIBUTE_LIST.\n");
-			return err;
+			goto out_unlock;
 		}
 	}
 
@@ -2856,17 +2865,18 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 			le16_to_cpu(ctx->mrec->attrs_offset) == 8) {
 		if (ntfs_mft_record_free(ni->vol, ni)) {
 			ntfs_debug("Couldn't free MFT record.\n");
-			return -EIO;
+			err = -EIO;
+			goto out_unlock;
 		}
 		/* Remove done if we freed base inode. */
 		if (ni == base_ni)
-			return 0;
+			goto out_unlock;
 		ntfs_inode_close(ni);
 		ctx->ntfs_ino = ni = NULL;
 	}
 
 	if (type == AT_ATTRIBUTE_LIST || !NInoAttrList(base_ni))
-		return 0;
+		goto out_unlock;
 
 	/* Remove attribute list if we don't need it any more. */
 	if (!ntfs_attrlist_need(base_ni)) {
@@ -2877,7 +2887,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		if (ntfs_attr_lookup(AT_ATTRIBUTE_LIST, NULL, 0, CASE_SENSITIVE,
 					0, NULL, 0, ctx)) {
 			ntfs_debug("Couldn't find attribute list. Succeed anyway.\n");
-			return 0;
+			goto out_unlock;
 		}
 		/* Deallocate clusters. */
 		if (ctx->attr->non_resident) {
@@ -2888,16 +2898,16 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 					ctx->attr, NULL, &new_rl_count);
 			if (IS_ERR(al_rl)) {
 				ntfs_debug("Couldn't decompress attribute list runlist. Succeed anyway.\n");
-				return 0;
+				goto out_unlock;
 			}
 			if (ntfs_cluster_free_from_rl(base_ni->vol, al_rl))
 				ntfs_debug("Leaking clusters! Run chkdsk. Couldn't free clusters from attribute list runlist.\n");
 			kvfree(al_rl);
 		}
 		/* Remove attribute record itself. */
-		if (ntfs_attr_record_rm(ctx, false)) {
+		if (ntfs_attr_record_rm(ctx, true)) {
 			ntfs_debug("Couldn't remove attribute list. Succeed anyway.\n");
-			return 0;
+			goto out_unlock;
 		}
 
 		na.mft_no = VFS_I(base_ni)->i_ino;
@@ -2913,7 +2923,10 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		}
 
 	}
-	return 0;
+out_unlock:
+	if (attrlist_locked && !persist_locked)
+		mutex_unlock(&base_ni->attr_list_persist_lock);
+	return err;
 }
 
 /*
