@@ -1337,18 +1337,35 @@ resize_failed:
 	 */
 	if ((ret == -ENOSPC) &&
 	    (ctx->al_cursor.valid || !ntfs_inode_add_attrlist(icx->idx_ni))) {
+		struct ntfs_inode *base_ni;
+
 		ntfs_attr_put_search_ctx(ctx);
 		ctx = NULL;
 		ir = ntfs_ir_lookup(icx->idx_ni, icx->name, icx->name_len, &ctx);
-		if (ir && !ntfs_attr_record_move_away(ctx, ix_root_size -
+		if (!ir)
+			goto clear_bmp;
+
+		base_ni = ctx->base_ntfs_ino ? ctx->base_ntfs_ino : ctx->ntfs_ino;
+		/*
+		 * ntfs_attr_record_move_away() rewrites the moved attribute's
+		 * ALE in place, so it and the persist below have to form one
+		 * transaction.  Nothing up this call chain holds the lock:
+		 * ntfs_inode_add_attrlist() above takes it on its own, and
+		 * ntfs_attrlist_update_locked() never reaches index code.
+		 */
+		mutex_lock(&base_ni->attr_list_persist_lock);
+		if (!ntfs_attr_record_move_away(ctx, ix_root_size -
 				le32_to_cpu(ctx->attr->data.resident.value_length))) {
-			if (ntfs_attrlist_update(ctx->base_ntfs_ino ?
-						 ctx->base_ntfs_ino : ctx->ntfs_ino))
+			if (ntfs_attrlist_update_locked(base_ni)) {
+				mutex_unlock(&base_ni->attr_list_persist_lock);
 				goto clear_bmp;
+			}
+			mutex_unlock(&base_ni->attr_list_persist_lock);
 			ntfs_attr_put_search_ctx(ctx);
 			ctx = NULL;
 			goto retry;
 		}
+		mutex_unlock(&base_ni->attr_list_persist_lock);
 	}
 clear_bmp:
 	ntfs_ibm_clear(icx, new_ib_vcn);

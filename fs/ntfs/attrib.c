@@ -2830,12 +2830,12 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		 * @persist_locked is true when we got here from
 		 * ntfs_attr_update_mapping_pairs() rebuilding the mapping
 		 * pairs of the $ATTRIBUTE_LIST attribute itself: that call
-		 * only happens underneath ntfs_attrlist_update(), which is
-		 * always invoked by ntfs_attrlist_entry_add()/rm() or
-		 * ntfs_inode_add_attrlist() while already holding this same
-		 * mutex. Taking it again here would deadlock the caller
-		 * against itself, so skip the (re-)acquisition in that case
-		 * and rely on the lock already held further up the stack.
+		 * only happens underneath ntfs_attrlist_update_locked(), which
+		 * is always invoked while already holding this same mutex for
+		 * the in-flight transaction. Taking it again here would
+		 * deadlock the caller against itself, so skip the
+		 * (re-)acquisition in that case and rely on the lock already
+		 * held further up the stack.
 		 */
 		if (!persist_locked)
 			mutex_lock(&base_ni->attr_list_persist_lock);
@@ -3544,6 +3544,12 @@ err_out:
  * ntfs_attr_record_move_to - move attribute record to target inode
  * @ctx:	attribute search context describing the attribute record
  * @ni:		opened ntfs inode to which move attribute record
+ *
+ * Caller must hold the base inode's attr_list_persist_lock: this rewrites
+ * the moved attribute's ALE in place, and that mutation has to be part of
+ * the same transaction as the persist that follows it.  Otherwise a
+ * concurrent ntfs_attrlist_update_locked() can copy the attribute list to
+ * disk while only one of @mft_reference/@instance has been updated.
  */
 int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode *ni)
 {
@@ -3625,6 +3631,8 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
 	/* Update attribute list. */
 	a = (struct attr_record *)nctx->attr;
 	base_ni = ntfs_attr_ctx_base_ni(ctx);
+
+	lockdep_assert_held(&base_ni->attr_list_persist_lock);
 
 	down_write(&base_ni->attr_list_lock);
 	ale = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
@@ -4048,7 +4056,14 @@ retry:
 					ntfs_debug("Attribute list is too big. Defragment the volume\n");
 					return -ENOSPC;
 				}
-				if (ntfs_attrlist_update(base_ni))
+				/*
+				 * This call is only ever reached while
+				 * rebuilding the $ATTRIBUTE_LIST attribute's
+				 * own mapping pairs, which happens underneath
+				 * ntfs_attrlist_update_locked() while holding
+				 * persist lock.
+				 */
+				if (ntfs_attrlist_update_locked(base_ni))
 					return -EIO;
 				goto retry;
 			}
@@ -4187,9 +4202,8 @@ retry:
 			/*
 			 * Remove unused attribute record. When @ni is the
 			 * $ATTRIBUTE_LIST attribute itself, we only get here
-			 * underneath ntfs_attrlist_update(), whose caller
-			 * (ntfs_attrlist_entry_add()/rm() or
-			 * ntfs_inode_add_attrlist()) already holds
+			 * underneath ntfs_attrlist_update_locked(), whose
+			 * caller already holds
 			 * base_ni->attr_list_persist_lock for this
 			 * transaction, so tell ntfs_attr_record_rm() not to
 			 * recurse into it.
@@ -5012,30 +5026,42 @@ attr_resize_again:
 	 */
 	if (attr_ni->type == AT_STANDARD_INFORMATION ||
 	    attr_ni->type == AT_ATTRIBUTE_LIST) {
-		ntfs_attr_put_search_ctx(ctx);
-
-		if (!NInoAttrList(base_ni)) {
-			err = ntfs_inode_add_attrlist(base_ni);
-			if (err)
-				return err;
-		}
-
-		err = ntfs_inode_free_space(base_ni, sizeof(struct attr_record));
-		if (err) {
-			err = -ENOSPC;
-			ntfs_error(sb,
-				"Couldn't free space in the MFT record to make attribute list non resident");
-			return err;
-		}
 		/*
 		 * Resizing the $ATTRIBUTE_LIST attribute itself only happens
 		 * underneath ntfs_attrlist_update_locked() while already holding
 		 * attr_list_persist_lock.
 		 */
-		if (attr_ni->type == AT_ATTRIBUTE_LIST)
-			err = ntfs_attrlist_update_locked(base_ni);
-		else
-			err = ntfs_attrlist_update(base_ni);
+		bool persist_locked = attr_ni->type == AT_ATTRIBUTE_LIST;
+
+		ntfs_attr_put_search_ctx(ctx);
+
+		if (!NInoAttrList(base_ni)) {
+			/* This takes attr_list_persist_lock on its own. */
+			err = ntfs_inode_add_attrlist(base_ni);
+			if (err)
+				return err;
+		}
+
+		/*
+		 * ntfs_inode_free_space() moves attributes out of the base MFT
+		 * record, rewriting their ALEs in place.  Keep those mutations
+		 * and the persist below inside one transaction.
+		 */
+		if (!persist_locked)
+			mutex_lock(&base_ni->attr_list_persist_lock);
+
+		err = ntfs_inode_free_space(base_ni, sizeof(struct attr_record));
+		if (err) {
+			if (!persist_locked)
+				mutex_unlock(&base_ni->attr_list_persist_lock);
+			err = -ENOSPC;
+			ntfs_error(sb,
+				"Couldn't free space in the MFT record to make attribute list non resident");
+			return err;
+		}
+		err = ntfs_attrlist_update_locked(base_ni);
+		if (!persist_locked)
+			mutex_unlock(&base_ni->attr_list_persist_lock);
 		if (err)
 			return err;
 		goto attr_resize_again;
@@ -5083,15 +5109,27 @@ attr_resize_again:
 	}
 	unmap_mft_record(ext_ni);
 
+	/*
+	 * Move the attribute and persist the resulting attribute list as one
+	 * transaction, so the ALE rewritten by ntfs_attr_record_move_to()
+	 * cannot be copied to disk half-updated.  attr_ni->type is neither
+	 * $STANDARD_INFORMATION nor $ATTRIBUTE_LIST here (both are handled
+	 * above), so we cannot already hold the lock via
+	 * ntfs_attrlist_update_locked().
+	 */
+	mutex_lock(&base_ni->attr_list_persist_lock);
+
 	/* Move attribute to it. */
 	err = ntfs_attr_record_move_to(ctx, ext_ni);
 	if (err) {
+		mutex_unlock(&base_ni->attr_list_persist_lock);
 		ntfs_error(sb, "Couldn't move attribute to new MFT record");
 		err = -ENOMEM;
 		goto put_err_out;
 	}
 
-	err = ntfs_attrlist_update(base_ni);
+	err = ntfs_attrlist_update_locked(base_ni);
+	mutex_unlock(&base_ni->attr_list_persist_lock);
 	if (err < 0)
 		goto put_err_out;
 

@@ -118,23 +118,6 @@ int ntfs_attrlist_update_locked(struct ntfs_inode *base_ni)
 }
 
 /*
- * ntfs_attrlist_update - persist the in-memory attribute list to disk
- * @base_ni:	base ntfs inode containing the attribute list
- *
- * Serialize the persist against concurrent attribute-list replacement
- * transactions.
- */
-int ntfs_attrlist_update(struct ntfs_inode *base_ni)
-{
-	int err;
-
-	mutex_lock(&base_ni->attr_list_persist_lock);
-	err = ntfs_attrlist_update_locked(base_ni);
-	mutex_unlock(&base_ni->attr_list_persist_lock);
-	return err;
-}
-
-/*
  * ntfs_attrlist_entry_add - add an attribute list attribute entry
  * @ni:	opened ntfs inode, which contains that attribute
  * @attr: attribute record to add to attribute list
