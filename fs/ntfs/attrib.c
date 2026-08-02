@@ -3951,7 +3951,7 @@ retry:
 	else
 		base_ni = ni;
 
-	if (NInoAttrList(base_ni) && ni->type != AT_ATTRIBUTE_LIST) {
+	if (ni->type != AT_ATTRIBUTE_LIST) {
 		mutex_lock(&base_ni->attr_list_persist_lock);
 		attrlist_locked = true;
 	}
