@@ -977,6 +977,9 @@ static int ntfs_write_named_stream(struct ntfs_inode *ni, __le16 *uname,
 	if (!ni || !uname || uname_len == 0 || !data_stream)
 		return -EINVAL;
 
+	if (NInoWofCompressed(ni))
+		return -EOPNOTSUPP;
+
 	if (len == 0 || len > NTFS_STREAM_MAX_IO)
 		return -EINVAL;
 
@@ -1040,6 +1043,9 @@ static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
 {
 	if (!ni || !uname || uname_len == 0)
 		return -EINVAL;
+
+	if (NInoWofCompressed(ni))
+		return -EOPNOTSUPP;
 
 	return ntfs_attr_remove(ni, AT_DATA, uname, uname_len);
 }
