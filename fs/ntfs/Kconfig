@@ -16,7 +16,7 @@ config NTFS_FS_WOF_COMPRESSION
 	help
 	  Enable read support for Windows system-compressed files.
 	  Windows more aggressively compresses system files such as binaries
-	  and DLLs using system compression.It is optimized for files that
+	  and DLLs using system compression. It is optimized for files that
 	  are rarely modified.
 	  Enabling this option builds the decompression support into the NTFS
 	  module.
