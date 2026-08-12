@@ -208,7 +208,8 @@ out_unlock:
 	return err;
 }
 
-static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
+static int parse_wof_chunk_table(struct ntfs_inode *base_ni,
+				 struct ntfs_inode *ni, u64 chunk_idx,
 				 u64 chunk_count, u64 *chunk_offset,
 				 u32 *chunk_size, void *table_buf,
 				 size_t table_buf_size)
@@ -220,7 +221,7 @@ static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
 	u32 bytes_to_read;
 	int ret = 0;
 
-	if (ni->data_size < (1ULL << 32))
+	if (i_size_read(VFS_I(base_ni)) < (1ULL << 32))
 		bytes_per_off = sizeof(__le32);
 	else
 		bytes_per_off = sizeof(__le64);
@@ -266,14 +267,13 @@ static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
 		u32 value_length;
 		u16 value_offset;
 
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 		if (!ctx) {
 			ret = -ENOMEM;
 			return ret;
 		}
-		ret = ntfs_attr_lookup(AT_DATA, (__le16 *)WOF_NAME,
-				       WOF_NAME_LEN, CASE_SENSITIVE, 0, NULL, 0,
-				       ctx);
+		ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+				       CASE_SENSITIVE, 0, NULL, 0, ctx);
 		if (ret)
 			goto out_put_ctx;
 
@@ -343,11 +343,11 @@ static int ntfs_read_wof_chunk(struct ntfs_volume *vol,
 		return 0;
 	}
 
-	ctx = ntfs_attr_get_search_ctx(wof_ni, NULL);
+	ctx = ntfs_attr_get_search_ctx(wof_ni->ext.base_ntfs_ino, NULL);
 	if (!ctx)
 		return -ENOMEM;
 
-	err = ntfs_attr_lookup(AT_DATA, (__le16 *)WOF_NAME, WOF_NAME_LEN,
+	err = ntfs_attr_lookup(wof_ni->type, wof_ni->name, wof_ni->name_len,
 			       CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err)
 		goto out_put_ctx;
@@ -610,7 +610,7 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 		u64 chunk_file_offset;
 		loff_t chunk_end, copy_start, copy_end;
 
-		err = parse_wof_chunk_table(wof_ni, chunk_idx, chunk_count,
+		err = parse_wof_chunk_table(ni, wof_ni, chunk_idx, chunk_count,
 					    &chunk_offset, &chunk_size,
 					    ws->input, ws->input_size);
 		if (err)
