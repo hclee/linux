@@ -1238,7 +1238,7 @@ static int ntfs_external_attr_find(const __le32 type,
 		const u32 ic, const s64 lowest_vcn,
 		const u8 *val, const u32 val_len, struct ntfs_attr_search_ctx *ctx)
 {
-	struct ntfs_inode *base_ni = ctx->base_ntfs_ino, *ni = ctx->ntfs_ino;
+	struct ntfs_inode *base_ni, *ni;
 	struct ntfs_volume *vol;
 	struct attr_list_entry *al_entry, *next_al_entry;
 	u8 *al_start, *al_end;
@@ -1251,6 +1251,11 @@ static int ntfs_external_attr_find(const __le32 type,
 	int err = 0;
 	static const char *es = " Unmount and run chkdsk.";
 
+restart:
+	base_ni = ctx->base_ntfs_ino;
+	ni = ctx->ntfs_ino;
+	is_first_search = false;
+	err = 0;
 	ntfs_debug("Entering for inode 0x%llx, type 0x%x.", ni->mft_no, type);
 	if (!base_ni) {
 		/* First call happens with the base mft record. */
@@ -1551,8 +1556,11 @@ do_next_attr_loop:
 			al_end = al_start + base_ni->attr_list_size;
 			al_entry = ntfs_attrlist_find_exact_locked(base_ni,
 								   &ctx->al_exact);
-			if (!al_entry)
+			if (!al_entry) {
+				if (ctx->al_exact.gen != base_ni->attr_list_gen)
+					goto restart_lookup;
 				goto corrupt;
+			}
 			al_entry = (struct attr_list_entry *)((u8 *)al_entry +
 							      le16_to_cpu(al_entry->length));
 			goto scan_ale;
@@ -1588,8 +1596,11 @@ do_next_attr_loop:
 		down_read(&base_ni->attr_list_lock);
 		attr_list_locked = true;
 		al_entry = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
-		if (!al_entry)
+		if (!al_entry) {
+			if (ctx->al_exact.gen != base_ni->attr_list_gen)
+				goto restart_lookup;
 			goto corrupt;
+		}
 		if (!ntfs_are_names_equal((__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
 					  a->name_length, al_entry->name,
 					  al_entry->name_length, CASE_SENSITIVE,
@@ -1630,6 +1641,12 @@ unlock_list_attr:
 	if (attr_list_locked)
 		up_read(&base_ni->attr_list_lock);
 	return err;
+
+restart_lookup:
+	up_read(&base_ni->attr_list_lock);
+	attr_list_locked = false;
+	ntfs_attr_reinit_search_ctx(ctx);
+	goto restart;
 
 corrupt:
 	if (ni != base_ni) {
