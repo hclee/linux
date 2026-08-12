@@ -349,10 +349,10 @@ unsigned int ntfs_parse_reparse(struct ntfs_inode *ni)
 		}
 		case IO_REPARSE_TAG_WOF:
 		{
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
 			const struct wof_reparse_data *wof_data =
 				(const struct wof_reparse_data *)reparse_attr->reparse_data;
 
-#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
 			switch (wof_data->compression_format) {
 			case WOF_COMPRESSION_XPRESS4K:
 				ni->itype.compressed.block_size_bits = 12;
