@@ -2862,21 +2862,19 @@ put_err_out:
 }
 
 /*
- * ntfs_attr_record_rm - remove attribute extent
+ * ntfs_attr_record_rm_locked - remove attribute extent
  * @ctx:		search context describing the attribute which should be removed
- * @persist_locked:	true if the caller already holds
- *			base_ni->attr_list_persist_lock for the in-flight
- *			transaction this removal is part of
  *
- * If this function succeed, user should reinit search context if he/she wants
- * use it anymore.
+ * The caller must hold base_ni->attr_list_persist_lock. If this function
+ * succeeds, the caller should reinitialize @ctx before using it again.
  */
-int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
+int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 {
 	struct ntfs_inode *base_ni, *ni;
+	struct attr_record *saved_attr = NULL;
+	u32 attr_len = 0, attr_off = 0;
 	__le32 type;
 	int err = 0;
-	bool attrlist_locked = persist_locked;
 
 	if (!ctx || !ctx->ntfs_ino || !ctx->mrec || !ctx->attr)
 		return -EINVAL;
@@ -2890,11 +2888,14 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		base_ni = ctx->base_ntfs_ino;
 	else
 		base_ni = ctx->ntfs_ino;
+	lockdep_assert_held(&base_ni->attr_list_persist_lock);
 
-	/* Keep ALE removal and the follow-up need check in one transaction. */
-	if (!attrlist_locked && type != AT_ATTRIBUTE_LIST) {
-		mutex_lock(&base_ni->attr_list_persist_lock);
-		attrlist_locked = true;
+	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
+		attr_len = le32_to_cpu(ctx->attr->length);
+		attr_off = (u8 *)ctx->attr - (u8 *)ctx->mrec;
+		saved_attr = kmemdup(ctx->attr, attr_len, GFP_NOFS);
+		if (!saved_attr)
+			return -ENOMEM;
 	}
 
 	/* Remove attribute itself. */
@@ -2913,29 +2914,23 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		err = ntfs_attrlist_entry_rm_locked(ctx);
 		if (err) {
 			ntfs_debug("Couldn't delete record from $ATTRIBUTE_LIST.\n");
+			ctx->attr = (struct attr_record *)((u8 *)ctx->mrec +
+							  attr_off);
+			if (ntfs_make_room_for_attr(ctx->mrec,
+						   (u8 *)ctx->attr, attr_len)) {
+				ntfs_error(base_ni->vol->sb,
+					   "Failed to restore attribute record after attribute-list update failure");
+				NVolSetErrors(base_ni->vol);
+				err = -EIO;
+				goto out_unlock;
+			}
+			memcpy(ctx->attr, saved_attr, attr_len);
 			goto out_unlock;
 		}
 	}
 
 	/* Post $ATTRIBUTE_LIST delete setup. */
 	if (type == AT_ATTRIBUTE_LIST) {
-		/*
-		 * attr_list_persist_lock serializes this in-memory attr_list
-		 * teardown against a concurrent ntfs_attrlist_entry_add()/rm()
-		 * transaction on the same inode.
-		 *
-		 * @persist_locked is true when we got here from
-		 * ntfs_attr_update_mapping_pairs() rebuilding the mapping
-		 * pairs of the $ATTRIBUTE_LIST attribute itself: that call
-		 * only happens underneath ntfs_attrlist_update_locked(), which
-		 * is always invoked while already holding this same mutex for
-		 * the in-flight transaction. Taking it again here would
-		 * deadlock the caller against itself, so skip the
-		 * (re-)acquisition in that case and rely on the lock already
-		 * held further up the stack.
-		 */
-		if (!persist_locked)
-			mutex_lock(&base_ni->attr_list_persist_lock);
 		down_write(&base_ni->attr_list_lock);
 		if (NInoAttrList(base_ni) && base_ni->attr_list)
 			kvfree(base_ni->attr_list);
@@ -2944,8 +2939,6 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 		base_ni->attr_list_gen++;
 		NInoClearAttrList(base_ni);
 		up_write(&base_ni->attr_list_lock);
-		if (!persist_locked)
-			mutex_unlock(&base_ni->attr_list_persist_lock);
 	}
 
 	/* Free MFT record, if it doesn't contain attributes. */
@@ -2993,7 +2986,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 			kvfree(al_rl);
 		}
 		/* Remove attribute record itself. */
-		if (ntfs_attr_record_rm(ctx, true)) {
+		if (ntfs_attr_record_rm_locked(ctx)) {
 			ntfs_debug("Couldn't remove attribute list. Succeed anyway.\n");
 			goto out_unlock;
 		}
@@ -3012,8 +3005,32 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx, bool persist_locked)
 
 	}
 out_unlock:
-	if (attrlist_locked && !persist_locked)
-		mutex_unlock(&base_ni->attr_list_persist_lock);
+	kfree(saved_attr);
+	return err;
+}
+
+/*
+ * ntfs_attr_record_rm - remove a non-$ATTRIBUTE_LIST extent
+ * @ctx:	search context describing the attribute which should be removed
+ *
+ * $ATTRIBUTE_LIST callers must acquire attr_list_persist_lock before lookup
+ * and call ntfs_attr_record_rm_locked() to preserve the persist-to-MFT lock
+ * order.
+ */
+int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
+{
+	struct ntfs_inode *base_ni;
+	int err;
+
+	if (!ctx || !ctx->ntfs_ino || !ctx->mrec || !ctx->attr)
+		return -EINVAL;
+	if (WARN_ON_ONCE(ctx->attr->type == AT_ATTRIBUTE_LIST))
+		return -EINVAL;
+
+	base_ni = ctx->base_ntfs_ino ? ctx->base_ntfs_ino : ctx->ntfs_ino;
+	mutex_lock(&base_ni->attr_list_persist_lock);
+	err = ntfs_attr_record_rm_locked(ctx);
+	mutex_unlock(&base_ni->attr_list_persist_lock);
 	return err;
 }
 
@@ -4306,10 +4323,12 @@ retry:
 			 * underneath ntfs_attrlist_update_locked(), whose
 			 * caller already holds
 			 * base_ni->attr_list_persist_lock for this
-			 * transaction, so tell ntfs_attr_record_rm() not to
-			 * recurse into it.
+			 * transaction.
 			 */
-			err = ntfs_attr_record_rm(ctx, ni->type == AT_ATTRIBUTE_LIST);
+			if (ni->type == AT_ATTRIBUTE_LIST)
+				err = ntfs_attr_record_rm_locked(ctx);
+			else
+				err = ntfs_attr_record_rm(ctx);
 			if (err) {
 				ntfs_error(sb, "Could not remove unused attr");
 				goto put_err_out;
@@ -5564,6 +5583,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	int err = 0, ret = 0;
 	struct ntfs_inode *base_ni;
 	struct super_block *sb = ni->vol->sb;
+	bool persist_locked;
 
 	if (NInoAttr(ni))
 		base_ni = ni->ext.base_ntfs_ino;
@@ -5573,17 +5593,24 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	ntfs_debug("Entering for inode 0x%llx, attr 0x%x.\n",
 			(long long) ni->mft_no, ni->type);
 
+	persist_locked = ni->type == AT_ATTRIBUTE_LIST;
+	if (persist_locked)
+		mutex_lock(&base_ni->attr_list_persist_lock);
+
 	/* Free cluster allocation. */
 	if (NInoNonResident(ni)) {
 		struct ntfs_attr_search_ctx *ctx;
 
 		err = ntfs_attr_map_whole_runlist(ni);
-		if (err)
-			return err;
+		if (err) {
+			ret = err;
+			goto out_unlock;
+		}
 		ctx = ntfs_attr_get_search_ctx(ni, NULL);
 		if (!ctx) {
 			ntfs_error(sb, "%s: Failed to get search context", __func__);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out_unlock;
 		}
 
 		ret = ntfs_cluster_free(ni, 0, -1, ctx);
@@ -5597,15 +5624,20 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx) {
 		ntfs_error(sb, "%s: Failed to get search context", __func__);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
 				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
-		err = ntfs_attr_record_rm(ctx, false);
+		if (persist_locked)
+			err = ntfs_attr_record_rm_locked(ctx);
+		else
+			err = ntfs_attr_record_rm(ctx);
 		if (err) {
 			ntfs_error(sb,
 				"Failed to remove attribute extent. Leaving inconstant metadata.\n");
 			ret = err;
+			break;
 		}
 		ntfs_attr_reinit_search_ctx(ctx);
 	}
@@ -5615,6 +5647,9 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 		ret = err;
 	}
 
+out_unlock:
+	if (persist_locked)
+		mutex_unlock(&base_ni->attr_list_persist_lock);
 	return ret;
 }
 

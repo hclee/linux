@@ -314,7 +314,7 @@ err_out:
 int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 {
 	u8 *new_al = NULL;
-	int err, new_al_len;
+	int ale_len, err, new_al_len;
 	bool rollback;
 	struct ntfs_inode *base_ni;
 	struct attr_list_entry *ale;
@@ -357,9 +357,10 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 		err = -EIO;
 		goto out_unlock;
 	}
+	ale_len = le16_to_cpu(ale->length);
 
 	/* Allocate memory for new attribute list. */
-	new_al_len = base_ni->attr_list_size - le16_to_cpu(ale->length);
+	new_al_len = base_ni->attr_list_size - ale_len;
 	new_al = kvzalloc(new_al_len, GFP_NOFS);
 	if (!new_al) {
 		up_write(&base_ni->attr_list_lock);
@@ -369,8 +370,9 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 
 	/* Copy entries from old attribute list to new. */
 	memcpy(new_al, base_ni->attr_list, (u8 *)ale - base_ni->attr_list);
-	memcpy(new_al + ((u8 *)ale - base_ni->attr_list), (u8 *)ale + le16_to_cpu(
-				ale->length), new_al_len - ((u8 *)ale - base_ni->attr_list));
+	memcpy(new_al + ((u8 *)ale - base_ni->attr_list),
+	       (u8 *)ale + ale_len,
+	       new_al_len - ((u8 *)ale - base_ni->attr_list));
 
 	/* Set new runlist. */
 	old_al = base_ni->attr_list;
@@ -385,7 +387,7 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 		down_write(&base_ni->attr_list_lock);
 		if (base_ni->attr_list == new_al) {
 			base_ni->attr_list = old_al;
-			base_ni->attr_list_size += le16_to_cpu(ale->length);
+			base_ni->attr_list_size += ale_len;
 			base_ni->attr_list_gen++;
 			rollback = true;
 		}
