@@ -691,7 +691,11 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 	if (NVolShutdown(NTFS_SB(file->f_mapping->host->i_sb)))
 		return -EIO;
 
-	if (NInoCompressed(NTFS_I(inode)) || NInoWofCompressed(NTFS_I(inode)))
+	if (NInoCompressed(NTFS_I(inode)))
+		return -EOPNOTSUPP;
+
+	if (NInoWofCompressed(NTFS_I(inode)) &&
+	    vma_desc_test_all(desc, VMA_SHARED_BIT, VMA_MAYWRITE_BIT))
 		return -EOPNOTSUPP;
 
 	if (vma_desc_test_all(desc, VMA_SHARED_BIT, VMA_MAYWRITE_BIT)) {
