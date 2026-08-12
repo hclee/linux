@@ -938,7 +938,7 @@ search:
 	if (err)
 		goto err_out;
 
-	err = ntfs_attr_record_rm(actx, false);
+	err = ntfs_attr_record_rm(actx);
 	if (err)
 		goto err_out;
 
