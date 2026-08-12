@@ -259,10 +259,11 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	int err;
 	loff_t old_size = vi->i_size;
 
-	if (NInoCompressed(ni) || NInoEncrypted(ni)) {
-		ntfs_warning(vi->i_sb,
-			"Changes in inode size are not supported yet for %s files, ignoring.",
-			NInoCompressed(ni) ? "compressed" : "encrypted");
+	if (NInoCompressed(ni) || NInoEncrypted(ni) || NInoWofCompressed(ni)) {
+		ntfs_warning(
+			vi->i_sb,
+			"Changes in inode size are not supported yet for %s files.",
+			NInoEncrypted(ni) ? "encrypted" : "compressed");
 		return -EOPNOTSUPP;
 	}
 
@@ -398,7 +399,8 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 			bdev_logical_block_size(inode->i_sb->s_bdev);
 
 		stat->result_mask |= STATX_DIOALIGN;
-		if (!NInoCompressed(ni) && !NInoEncrypted(ni)) {
+		if (!NInoCompressed(ni) && !NInoEncrypted(ni) &&
+		    !NInoWofCompressed(ni)) {
 			stat->dio_mem_align = align;
 			stat->dio_offset_align = align;
 		}
@@ -441,7 +443,8 @@ static ssize_t ntfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (NVolShutdown(NTFS_SB(sb)))
 		return -EIO;
 
-	if (NInoCompressed(NTFS_I(vi)) && iocb->ki_flags & IOCB_DIRECT)
+	if ((NInoCompressed(NTFS_I(vi)) || NInoWofCompressed(NTFS_I(vi))) &&
+	    iocb->ki_flags & IOCB_DIRECT)
 		return -EOPNOTSUPP;
 
 	inode_lock_shared(vi);
@@ -572,6 +575,9 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (NVolShutdown(vol))
 		return -EIO;
 
+	if (NInoWofCompressed(ni))
+		return -EOPNOTSUPP;
+
 	if (NInoEncrypted(ni)) {
 		ntfs_error(vi->i_sb, "Writing for %s files is not supported yet",
 			   NInoCompressed(ni) ? "Compressed" : "Encrypted");
@@ -656,6 +662,9 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	vm_fault_t ret;
 
+	if (NInoWofCompressed(NTFS_I(inode)))
+		return VM_FAULT_SIGBUS;
+
 	sb_start_pagefault(inode->i_sb);
 	file_update_time(vmf->vma->vm_file);
 
@@ -678,7 +687,7 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 	if (NVolShutdown(NTFS_SB(file->f_mapping->host->i_sb)))
 		return -EIO;
 
-	if (NInoCompressed(NTFS_I(inode)))
+	if (NInoCompressed(NTFS_I(inode)) || NInoWofCompressed(NTFS_I(inode)))
 		return -EOPNOTSUPP;
 
 	if (vma_desc_test_all(desc, VMA_SHARED_BIT, VMA_MAYWRITE_BIT)) {
@@ -1629,7 +1638,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 	old_size = i_size_read(vi);
 
 	inode_lock(vi);
-	if (NInoCompressed(ni) || NInoEncrypted(ni)) {
+	if (NInoCompressed(ni) || NInoEncrypted(ni) || NInoWofCompressed(ni)) {
 		err = -EOPNOTSUPP;
 		goto out;
 	}

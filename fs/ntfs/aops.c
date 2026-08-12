@@ -93,9 +93,14 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 		/* Compressed data streams are handled in compress.c. */
 		if (NInoNonResident(ni) && NInoCompressed(ni))
 			return ntfs_read_compressed_block(folio);
-#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
 		else if (NInoWofCompressed(ni))
+#ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
 			return ntfs_read_wof_compressed_block(folio);
+#else
+		{
+			folio_unlock(folio);
+			return -EOPNOTSUPP;
+		}
 #endif
 	}
 
