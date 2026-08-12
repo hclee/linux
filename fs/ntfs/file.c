@@ -131,7 +131,8 @@ out_unlock:
 
 static int ntfs_file_release(struct inode *vi, struct file *filp)
 {
-	if (!NInoCompressed(NTFS_I(vi)))
+	if (!NInoCompressed(NTFS_I(vi)) &&
+	    !NInoWofCompressed(NTFS_I(vi)))
 		return ntfs_trim_prealloc(vi);
 
 	return 0;
@@ -253,13 +254,19 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	return ret;
 }
 
+static bool ntfs_data_change_unsupported(struct ntfs_inode *ni)
+{
+	return NInoCompressed(ni) || NInoEncrypted(ni) ||
+		NInoWofCompressed(ni);
+}
+
 static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	int err;
 	loff_t old_size = vi->i_size;
 
-	if (NInoCompressed(ni) || NInoEncrypted(ni) || NInoWofCompressed(ni)) {
+	if (ntfs_data_change_unsupported(ni)) {
 		ntfs_warning(
 			vi->i_sb,
 			"Changes in inode size are not supported yet for %s files.",
@@ -311,6 +318,11 @@ int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	err = setattr_prepare(idmap, dentry, attr);
 	if (err)
 		goto out;
+
+	if ((ia_valid & ATTR_SIZE) && ntfs_data_change_unsupported(ni)) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
 
 	if (!(vol->vol_flags & VOLUME_IS_DIRTY))
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
@@ -1632,6 +1644,9 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 	if (mode & ~(NTFS_FALLOC_FL_SUPPORTED))
 		return -EOPNOTSUPP;
 
+	if (ntfs_data_change_unsupported(ni))
+		return -EOPNOTSUPP;
+
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
 
@@ -1655,7 +1670,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 	old_size = i_size_read(vi);
 
 	inode_lock(vi);
-	if (NInoCompressed(ni) || NInoEncrypted(ni) || NInoWofCompressed(ni)) {
+	if (ntfs_data_change_unsupported(ni)) {
 		err = -EOPNOTSUPP;
 		goto out;
 	}
