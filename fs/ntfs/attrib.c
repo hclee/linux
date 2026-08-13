@@ -5622,7 +5622,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	int err = 0, ret = 0;
 	struct ntfs_inode *base_ni;
 	struct super_block *sb = ni->vol->sb;
-	bool persist_locked;
+	bool free_clusters, persist_locked;
 
 	if (NInoAttr(ni))
 		base_ni = ni->ext.base_ntfs_ino;
@@ -5632,31 +5632,18 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	ntfs_debug("Entering for inode 0x%llx, attr 0x%x.\n",
 			(long long) ni->mft_no, ni->type);
 
+	free_clusters = NInoNonResident(ni);
 	persist_locked = ni->type == AT_ATTRIBUTE_LIST;
 	if (persist_locked)
 		mutex_lock(&base_ni->attr_list_persist_lock);
 
-	/* Free cluster allocation. */
-	if (NInoNonResident(ni)) {
-		struct ntfs_attr_search_ctx *ctx;
-
+	/* Map clusters now, but keep them allocated until record removal commits. */
+	if (free_clusters) {
 		err = ntfs_attr_map_whole_runlist(ni);
 		if (err) {
 			ret = err;
 			goto out_unlock;
 		}
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
-		if (!ctx) {
-			ntfs_error(sb, "%s: Failed to get search context", __func__);
-			ret = -ENOMEM;
-			goto out_unlock;
-		}
-
-		ret = ntfs_cluster_free(ni, 0, -1, ctx);
-		if (ret < 0)
-			ntfs_error(sb,
-				"Failed to free cluster allocation. Leaving inconstant metadata.\n");
-		ntfs_attr_put_search_ctx(ctx);
 	}
 
 	/* Search for attribute extents and remove them all. */
@@ -5684,6 +5671,15 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	if (err != -ENOENT) {
 		ntfs_error(sb, "Attribute lookup failed. Probably leaving inconstant metadata.\n");
 		ret = err;
+	}
+	if (!ret && free_clusters) {
+		err = ntfs_cluster_free(ni, 0, -1, NULL);
+		if (err < 0) {
+			ntfs_error(
+				sb,
+				"Failed to free cluster allocation. Leaving inconstant metadata.\n");
+			ret = err;
+		}
 	}
 
 out_unlock:
