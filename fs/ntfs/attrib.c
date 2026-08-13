@@ -1270,6 +1270,13 @@ restart:
 	vol = base_ni->vol;
 	down_read(&base_ni->attr_list_lock);
 	attr_list_locked = true;
+	if (!NInoAttrList(base_ni) || !base_ni->attr_list) {
+		up_read(&base_ni->attr_list_lock);
+		attr_list_locked = false;
+		ntfs_attr_reinit_search_ctx(ctx);
+		return ntfs_attr_find(type, name, name_len, ic, val, val_len,
+				      ctx);
+	}
 	al_start = base_ni->attr_list;
 	al_end = al_start + base_ni->attr_list_size;
 	if (!ctx->al_cursor.valid ||
