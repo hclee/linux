@@ -1089,6 +1089,11 @@ view_index_meta:
 		/* Setup the state. */
 		if (a->flags & (ATTR_COMPRESSION_MASK | ATTR_IS_SPARSE)) {
 			if (a->flags & ATTR_COMPRESSION_MASK) {
+				if (NInoWofCompressed(ni)) {
+					ntfs_error(vi->i_sb,
+						"Found native compression on a WOF file.");
+					goto unm_err_out;
+				}
 				NInoSetCompressed(ni);
 				ni->flags |= FILE_ATTR_COMPRESSED;
 				if (vol->cluster_size > 4096) {
