@@ -90,18 +90,17 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 			folio_unlock(folio);
 			return -EOPNOTSUPP;
 		}
-		/* Compressed data streams are handled in compress.c. */
-		if (NInoNonResident(ni) && NInoCompressed(ni))
-			return ntfs_read_compressed_block(folio);
-		else if (NInoWofCompressed(ni))
+		if (NInoWofCompressed(ni)) {
 #ifdef CONFIG_NTFS_FS_WOF_COMPRESSION
 			return ntfs_read_wof_compressed_block(folio);
 #else
-		{
 			folio_unlock(folio);
 			return -EOPNOTSUPP;
-		}
 #endif
+		}
+		/* Compressed data streams are handled in compress.c. */
+		if (NInoNonResident(ni) && NInoCompressed(ni))
+			return ntfs_read_compressed_block(folio);
 	}
 
 	iomap_read_folio(&ntfs_read_iomap_ops, &ctx, NULL);
