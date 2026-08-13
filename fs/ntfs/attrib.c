@@ -2864,11 +2864,18 @@ static int ntfs_attr_record_restore(struct ntfs_attr_search_ctx *ctx,
 {
 	struct ntfs_attr_search_ctx *restore_ctx;
 	const __le16 *name = NULL;
+	const u8 *val = NULL;
+	u32 val_len = 0;
 	int err;
 
 	if (saved_attr->name_length)
 		name = (const __le16 *)((const u8 *)saved_attr +
 				       le16_to_cpu(saved_attr->name_offset));
+	if (!saved_attr->non_resident) {
+		val = (const u8 *)saved_attr +
+		      le16_to_cpu(saved_attr->data.resident.value_offset);
+		val_len = le32_to_cpu(saved_attr->data.resident.value_length);
+	}
 
 	restore_ctx = ntfs_attr_get_search_ctx(ctx->ntfs_ino, ctx->mrec);
 	if (!restore_ctx)
@@ -2877,7 +2884,7 @@ static int ntfs_attr_record_restore(struct ntfs_attr_search_ctx *ctx,
 	do {
 		err = ntfs_attr_find(saved_attr->type, name,
 				     saved_attr->name_length, CASE_SENSITIVE,
-				     NULL, 0, restore_ctx);
+				     val, val_len, restore_ctx);
 	} while (!err);
 	if (err != -ENOENT)
 		goto out;
