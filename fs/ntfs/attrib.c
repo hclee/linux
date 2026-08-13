@@ -2861,6 +2861,44 @@ put_err_out:
 	return -1;
 }
 
+static int ntfs_attr_record_restore(struct ntfs_attr_search_ctx *ctx,
+				    const struct attr_record *saved_attr)
+{
+	struct ntfs_attr_search_ctx *restore_ctx;
+	const __le16 *name = NULL;
+	int err;
+
+	if (saved_attr->name_length)
+		name = (const __le16 *)((const u8 *)saved_attr +
+				       le16_to_cpu(saved_attr->name_offset));
+
+	restore_ctx = ntfs_attr_get_search_ctx(ctx->ntfs_ino, ctx->mrec);
+	if (!restore_ctx)
+		return -ENOMEM;
+
+	do {
+		err = ntfs_attr_find(saved_attr->type, name,
+				     saved_attr->name_length, CASE_SENSITIVE,
+				     NULL, 0, restore_ctx);
+	} while (!err);
+	if (err != -ENOENT)
+		goto out;
+
+	err = ntfs_make_room_for_attr(restore_ctx->mrec,
+				      (u8 *)restore_ctx->attr,
+				      le32_to_cpu(saved_attr->length));
+	if (err)
+		goto out;
+
+	memcpy(restore_ctx->attr, saved_attr,
+	       le32_to_cpu(saved_attr->length));
+	ctx->attr = restore_ctx->attr;
+	err = 0;
+out:
+	ntfs_attr_put_search_ctx(restore_ctx);
+	return err;
+}
+
 /*
  * ntfs_attr_record_rm_locked - remove attribute extent
  * @ctx:		search context describing the attribute which should be removed
@@ -2872,7 +2910,7 @@ int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 {
 	struct ntfs_inode *base_ni, *ni;
 	struct attr_record *saved_attr = NULL;
-	u32 attr_len = 0, attr_off = 0;
+	u32 attr_len = 0;
 	__le32 type;
 	int err = 0;
 
@@ -2892,7 +2930,6 @@ int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 
 	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
 		attr_len = le32_to_cpu(ctx->attr->length);
-		attr_off = (u8 *)ctx->attr - (u8 *)ctx->mrec;
 		saved_attr = kmemdup(ctx->attr, attr_len, GFP_NOFS);
 		if (!saved_attr)
 			return -ENOMEM;
@@ -2914,10 +2951,7 @@ int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 		err = ntfs_attrlist_entry_rm_locked(ctx);
 		if (err) {
 			ntfs_debug("Couldn't delete record from $ATTRIBUTE_LIST.\n");
-			ctx->attr = (struct attr_record *)((u8 *)ctx->mrec +
-							  attr_off);
-			if (ntfs_make_room_for_attr(ctx->mrec,
-						   (u8 *)ctx->attr, attr_len)) {
+			if (ntfs_attr_record_restore(ctx, saved_attr)) {
 				ntfs_error(base_ni->vol->sb,
 					   "Failed to restore attribute record after attribute-list update failure");
 				NVolSetErrors(base_ni->vol);
