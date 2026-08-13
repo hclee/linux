@@ -1279,8 +1279,10 @@ restart:
 	}
 	al_start = base_ni->attr_list;
 	al_end = al_start + base_ni->attr_list_size;
+	if (ctx->al_cursor.valid &&
+	    ctx->al_cursor.gen != base_ni->attr_list_gen)
+		goto restart_lookup;
 	if (!ctx->al_cursor.valid ||
-	    ctx->al_cursor.gen != base_ni->attr_list_gen ||
 	    ctx->al_cursor.off >= base_ni->attr_list_size) {
 		ctx->al_cursor.off = 0;
 		ctx->al_cursor.gen = base_ni->attr_list_gen;
