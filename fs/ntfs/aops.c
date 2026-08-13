@@ -144,11 +144,12 @@ static sector_t ntfs_bmap(struct address_space *mapping, sector_t block)
 	ntfs_debug("Entering for mft_no 0x%llx, logical block 0x%llx.",
 			ni->mft_no, (unsigned long long)block);
 	if (ni->type != AT_DATA || !NInoNonResident(ni) || NInoEncrypted(ni) ||
-	    NInoMstProtected(ni)) {
+	    NInoWofCompressed(ni) || NInoMstProtected(ni)) {
 		ntfs_error(vol->sb, "BMAP does not make sense for %s attributes, returning 0.",
 				(ni->type != AT_DATA) ? "non-data" :
 				(!NInoNonResident(ni) ? "resident" :
-				"encrypted"));
+				(NInoWofCompressed(ni) ? "WOF-compressed" :
+				"encrypted")));
 		return 0;
 	}
 	/* None of these can happen. */

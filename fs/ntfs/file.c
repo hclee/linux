@@ -413,6 +413,10 @@ static loff_t ntfs_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	struct inode *inode = file->f_mapping->host;
 
+	if (NInoWofCompressed(NTFS_I(inode)) &&
+	    (whence == SEEK_HOLE || whence == SEEK_DATA))
+		return -EOPNOTSUPP;
+
 	switch (whence) {
 	case SEEK_HOLE:
 		inode_lock_shared(inode);
@@ -715,6 +719,9 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 static int ntfs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		u64 start, u64 len)
 {
+	if (NInoWofCompressed(NTFS_I(inode)))
+		return -EOPNOTSUPP;
+
 	return iomap_fiemap(inode, fieinfo, start, len, &ntfs_read_iomap_ops);
 }
 
