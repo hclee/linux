@@ -383,6 +383,8 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 
 	err = ntfs_attrlist_update_locked(base_ni);
 	if (err) {
+		int rollback_err;
+
 		rollback = false;
 		down_write(&base_ni->attr_list_lock);
 		if (base_ni->attr_list == new_al) {
@@ -392,8 +394,17 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 			rollback = true;
 		}
 		up_write(&base_ni->attr_list_lock);
-		if (rollback)
+		if (rollback) {
 			kvfree(new_al);
+			rollback_err = ntfs_attrlist_update_locked(base_ni);
+			if (rollback_err) {
+				ntfs_error(
+					base_ni->vol->sb,
+					"Failed to restore attribute list of inode %#llx",
+					(long long)base_ni->mft_no);
+				NVolSetErrors(base_ni->vol);
+			}
+		}
 		goto out_unlock;
 	}
 	kvfree(old_al);
