@@ -1249,7 +1249,6 @@ static int ntfs_external_attr_find(const __le32 type,
 	bool is_first_search = false;
 	bool attr_list_locked = false;
 	int err = 0;
-	static const char *es = " Unmount and run chkdsk.";
 
 restart:
 	base_ni = ctx->base_ntfs_ino;
@@ -1386,7 +1385,7 @@ scan_ale:
 		/* Out of bounds check. */
 		if ((u8 *)al_entry < base_ni->attr_list ||
 				(u8 *)al_entry > al_end)
-			break;	/* Inode is corrupt. */
+			goto corrupt;
 		ctx->al_cursor.off = (u8 *)al_entry - al_start;
 		ctx->al_cursor.gen = base_ni->attr_list_gen;
 		ctx->al_cursor.valid = true;
@@ -1401,7 +1400,7 @@ scan_ale:
 		     offsetof(struct attr_list_entry, name_length)) ||
 		    (al_entry->name_length && ((u8 *)al_entry + al_entry->name_offset +
 					       al_entry->name_length * sizeof(__le16)) > al_end))
-			break; /* corrupt */
+			goto corrupt;
 
 		next_al_entry = (struct attr_list_entry *)((u8 *)al_entry +
 				le16_to_cpu(al_entry->length));
@@ -1491,10 +1490,7 @@ is_enumeration:
 		if (MREF_LE(ctx->al_exact.key.mft_reference) == ni->mft_no) {
 			if (MSEQNO_LE(ctx->al_exact.key.mft_reference) !=
 			    ni->seq_no) {
-				ntfs_error(vol->sb,
-					"Found stale mft reference in attribute list of base inode 0x%llx.%s",
-					base_ni->mft_no, es);
-				err = -EIO;
+				err = 0;
 				break;
 			}
 		} else { /* Mft references do not match. */
@@ -1514,13 +1510,9 @@ is_enumeration:
 								ctx->al_exact.key.mft_reference),
 							      &ni);
 				if (IS_ERR(ctx->mrec)) {
-					ntfs_error(vol->sb,
-						   "Failed to map extent mft record 0x%lx of base inode 0x%llx.%s",
-						   MREF_LE(ctx->al_exact.key.mft_reference),
-						   base_ni->mft_no, es);
 					err = PTR_ERR(ctx->mrec);
 					if (err == -ENOENT)
-						err = -EIO;
+						err = 0;
 					/* Cause @ctx to be sanitized below. */
 					ni = NULL;
 					break;
@@ -1653,6 +1645,26 @@ do_next_attr:
 		a = (struct attr_record *)((u8 *)a + attr_len);
 		goto do_next_attr_loop;
 	}
+
+	if (err == -ENOMEM)
+		goto corrupt;
+	if (!attr_list_locked) {
+		down_read(&base_ni->attr_list_lock);
+		attr_list_locked = true;
+	}
+	if (!NInoAttrList(base_ni) || !base_ni->attr_list ||
+	    ctx->al_exact.gen != base_ni->attr_list_gen) {
+		if (ni != base_ni) {
+			if (ni)
+				unmap_extent_mft_record(ni);
+			ctx->ntfs_ino = base_ni;
+			ctx->mrec = ctx->base_mrec;
+			ctx->attr = ctx->base_attr;
+			ctx->mapped_mrec = ctx->mapped_base_mrec;
+		}
+		goto restart_lookup;
+	}
+	goto corrupt;
 
 unlock_list_attr:
 	if (attr_list_locked)
