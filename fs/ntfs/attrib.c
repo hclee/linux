@@ -1646,8 +1646,6 @@ do_next_attr:
 		goto do_next_attr_loop;
 	}
 
-	if (err == -ENOMEM)
-		goto corrupt;
 	if (!attr_list_locked) {
 		down_read(&base_ni->attr_list_lock);
 		attr_list_locked = true;
