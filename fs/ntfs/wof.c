@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/blkdev.h>
 #include <linux/pagemap.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
@@ -454,6 +455,7 @@ static int ntfs_wof_decode_folios_direct(struct ntfs_wof_workspace *ws,
 	unsigned int page_offset = offset_in_page(chunk_start);
 	struct ntfs_wof_dest dest;
 	void *addr;
+	unsigned int nofs_flags;
 	int err;
 
 	err = ntfs_wof_collect_dest(mapping, target, chunk_start, chunk_end,
@@ -463,7 +465,9 @@ static int ntfs_wof_decode_folios_direct(struct ntfs_wof_workspace *ws,
 		return -EAGAIN;
 	}
 
+	nofs_flags = memalloc_nofs_save();
 	addr = vmap(dest.pages, dest.nr_pages, VM_MAP, PAGE_KERNEL);
+	memalloc_nofs_restore(nofs_flags);
 	if (!addr) {
 		ntfs_wof_release_dest(&dest, target, false);
 		return -EAGAIN;
