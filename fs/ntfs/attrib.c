@@ -3085,18 +3085,49 @@ metadata_error:
 int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 {
 	struct ntfs_inode *base_ni;
+	struct attr_record *attr;
 	int err;
 
 	if (!ctx || !ctx->ntfs_ino || !ctx->mrec || !ctx->attr)
 		return -EINVAL;
-	if (WARN_ON_ONCE(ctx->attr->type == AT_ATTRIBUTE_LIST))
-		return -EINVAL;
 
 	base_ni = ctx->base_ntfs_ino ? ctx->base_ntfs_ino : ctx->ntfs_ino;
 	mutex_lock(&base_ni->attr_list_persist_lock);
+	if (ctx->al_exact.valid) {
+		if (MREF_LE(ctx->al_exact.key.mft_reference) !=
+			    ctx->ntfs_ino->mft_no ||
+		    MSEQNO_LE(ctx->al_exact.key.mft_reference) !=
+			    ctx->ntfs_ino->seq_no) {
+			err = -EIO;
+			goto metadata_error;
+		}
+		attr = ntfs_attr_record_find_by_key(ctx->mrec,
+						    &ctx->al_exact.key);
+		if (IS_ERR(attr)) {
+			err = -EIO;
+			goto metadata_error;
+		}
+		if (!attr) {
+			err = -ENOENT;
+			goto out_unlock;
+		}
+		ctx->attr = attr;
+	}
+	if (WARN_ON_ONCE(ctx->attr->type == AT_ATTRIBUTE_LIST)) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
 	err = ntfs_attr_record_rm_locked(ctx);
+out_unlock:
 	mutex_unlock(&base_ni->attr_list_persist_lock);
 	return err;
+
+metadata_error:
+	ntfs_error(base_ni->vol->sb,
+		   "Inconsistent attribute record in inode 0x%llx",
+		   (long long)ctx->ntfs_ino->mft_no);
+	NVolSetErrors(base_ni->vol);
+	goto out_unlock;
 }
 
 /*
@@ -5648,7 +5679,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	int err = 0, ret = 0;
 	struct ntfs_inode *base_ni;
 	struct super_block *sb = ni->vol->sb;
-	bool free_clusters, persist_locked;
+	bool free_clusters;
 
 	if (NInoAttr(ni))
 		base_ni = ni->ext.base_ntfs_ino;
@@ -5659,9 +5690,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 			(long long) ni->mft_no, ni->type);
 
 	free_clusters = NInoNonResident(ni);
-	persist_locked = ni->type == AT_ATTRIBUTE_LIST;
-	if (persist_locked)
-		mutex_lock(&base_ni->attr_list_persist_lock);
+	mutex_lock(&base_ni->attr_list_persist_lock);
 
 	/* Map clusters now, but keep them allocated until record removal commits. */
 	if (free_clusters) {
@@ -5681,10 +5710,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	}
 	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
 				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
-		if (persist_locked)
-			err = ntfs_attr_record_rm_locked(ctx);
-		else
-			err = ntfs_attr_record_rm(ctx);
+		err = ntfs_attr_record_rm_locked(ctx);
 		if (err) {
 			ntfs_error(sb,
 				"Failed to remove attribute extent. Leaving inconstant metadata.\n");
@@ -5707,10 +5733,8 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 			ret = err;
 		}
 	}
-
 out_unlock:
-	if (persist_locked)
-		mutex_unlock(&base_ni->attr_list_persist_lock);
+	mutex_unlock(&base_ni->attr_list_persist_lock);
 	return ret;
 }
 
