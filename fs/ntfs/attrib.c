@@ -2859,49 +2859,63 @@ put_err_out:
 	return -1;
 }
 
-static int ntfs_attr_record_restore(struct ntfs_attr_search_ctx *ctx,
-				    const struct attr_record *saved_attr)
+static struct attr_record *
+ntfs_attr_record_find_by_key(struct mft_record *mrec,
+			     const struct ntfs_attrlist_exact_key *key)
 {
-	struct ntfs_attr_search_ctx *restore_ctx;
-	const __le16 *name = NULL;
-	const u8 *val = NULL;
-	u32 val_len = 0;
-	int err;
+	struct attr_record *attr;
+	u32 attr_len, attrs_offset, bytes_allocated, bytes_in_use, name_offset;
+	u8 *end;
 
-	if (saved_attr->name_length)
-		name = (const __le16 *)((const u8 *)saved_attr +
-				       le16_to_cpu(saved_attr->name_offset));
-	if (!saved_attr->non_resident) {
-		val = (const u8 *)saved_attr +
-		      le16_to_cpu(saved_attr->data.resident.value_offset);
-		val_len = le32_to_cpu(saved_attr->data.resident.value_length);
+	attrs_offset = le16_to_cpu(mrec->attrs_offset);
+	bytes_in_use = le32_to_cpu(mrec->bytes_in_use);
+	bytes_allocated = le32_to_cpu(mrec->bytes_allocated);
+	if ((attrs_offset & 7) || attrs_offset > bytes_in_use ||
+	    bytes_in_use > bytes_allocated ||
+	    bytes_in_use - attrs_offset < sizeof(attr->type))
+		return ERR_PTR(-EUCLEAN);
+
+	end = (u8 *)mrec + bytes_in_use;
+	for (attr = (struct attr_record *)((u8 *)mrec + attrs_offset);
+	     (u8 *)attr < end;
+	     attr = (struct attr_record *)((u8 *)attr + attr_len)) {
+		if (end - (u8 *)attr < sizeof(attr->type))
+			return ERR_PTR(-EUCLEAN);
+		if (attr->type == AT_END)
+			return NULL;
+		if (end - (u8 *)attr <
+		    offsetof(struct attr_record, data.resident.reserved) +
+			    sizeof(attr->data.resident.reserved))
+			return ERR_PTR(-EUCLEAN);
+		if (attr->non_resident > 1)
+			return ERR_PTR(-EUCLEAN);
+
+		attr_len = le32_to_cpu(attr->length);
+		if (!attr_len || (attr_len & 7) || attr_len > end - (u8 *)attr)
+			return ERR_PTR(-EUCLEAN);
+		if (attr->name_length) {
+			name_offset = le16_to_cpu(attr->name_offset);
+			if (name_offset > attr_len ||
+			    attr->name_length >
+				    (attr_len - name_offset) / sizeof(__le16))
+				return ERR_PTR(-EUCLEAN);
+		}
+
+		if (attr->type != key->type ||
+		    attr->instance != key->instance ||
+		    attr->name_length != key->name_len)
+			continue;
+		if (attr->non_resident) {
+			if (attr->data.non_resident.lowest_vcn !=
+			    key->lowest_vcn)
+				continue;
+		} else if (key->lowest_vcn != 0) {
+			continue;
+		}
+		return attr;
 	}
 
-	restore_ctx = ntfs_attr_get_search_ctx(ctx->ntfs_ino, ctx->mrec);
-	if (!restore_ctx)
-		return -ENOMEM;
-
-	do {
-		err = ntfs_attr_find(saved_attr->type, name,
-				     saved_attr->name_length, CASE_SENSITIVE,
-				     val, val_len, restore_ctx);
-	} while (!err);
-	if (err != -ENOENT)
-		goto out;
-
-	err = ntfs_make_room_for_attr(restore_ctx->mrec,
-				      (u8 *)restore_ctx->attr,
-				      le32_to_cpu(saved_attr->length));
-	if (err)
-		goto out;
-
-	memcpy(restore_ctx->attr, saved_attr,
-	       le32_to_cpu(saved_attr->length));
-	ctx->attr = restore_ctx->attr;
-	err = 0;
-out:
-	ntfs_attr_put_search_ctx(restore_ctx);
-	return err;
+	return ERR_PTR(-EUCLEAN);
 }
 
 /*
@@ -2914,8 +2928,7 @@ out:
 int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 {
 	struct ntfs_inode *base_ni, *ni;
-	struct attr_record *saved_attr = NULL;
-	u32 attr_len = 0;
+	struct attr_record *attr;
 	__le32 type;
 	int err = 0;
 
@@ -2934,39 +2947,46 @@ int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 	lockdep_assert_held(&base_ni->attr_list_persist_lock);
 
 	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
-		attr_len = le32_to_cpu(ctx->attr->length);
-		saved_attr = kmemdup(ctx->attr, attr_len, GFP_NOFS);
-		if (!saved_attr)
-			return -ENOMEM;
-	}
+		if (!ctx->al_exact.valid ||
+		    MREF_LE(ctx->al_exact.key.mft_reference) != ni->mft_no ||
+		    MSEQNO_LE(ctx->al_exact.key.mft_reference) != ni->seq_no) {
+			err = -EIO;
+			goto metadata_error;
+		}
+		attr = ntfs_attr_record_find_by_key(ctx->mrec,
+						    &ctx->al_exact.key);
+		if (IS_ERR_OR_NULL(attr) || attr != ctx->attr) {
+			err = -EIO;
+			goto metadata_error;
+		}
 
-	/* Remove attribute itself. */
-	if (ntfs_attr_record_resize(ctx->mrec, ctx->attr, 0)) {
-		ntfs_debug("Couldn't remove attribute record. Bug or damaged MFT record.\n");
-		err = -EIO;
-		goto out_unlock;
-	}
-	mark_mft_record_dirty(ni);
-
-	/*
-	 * Remove record from $ATTRIBUTE_LIST if present and we don't want
-	 * delete $ATTRIBUTE_LIST itself.
-	 */
-	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
+		/*
+		 * Commit the ALE removal before deleting its attribute record.
+		 * Updating $ATTRIBUTE_LIST can move records in this MFT record,
+		 * so relocate the target by instance before using it again.
+		 */
 		err = ntfs_attrlist_entry_rm_locked(ctx);
 		if (err) {
+			if (err == -EUCLEAN)
+				goto metadata_error;
 			ntfs_debug("Couldn't delete record from $ATTRIBUTE_LIST.\n");
-			if (ntfs_attr_record_restore(ctx, saved_attr)) {
-				ntfs_error(base_ni->vol->sb,
-					   "Failed to restore attribute record after attribute-list update failure");
-				NVolSetErrors(base_ni->vol);
-				err = -EIO;
-				goto out_unlock;
-			}
-			memcpy(ctx->attr, saved_attr, attr_len);
 			goto out_unlock;
 		}
+		attr = ntfs_attr_record_find_by_key(ctx->mrec,
+						    &ctx->al_exact.key);
+		if (IS_ERR_OR_NULL(attr)) {
+			err = -EIO;
+			goto metadata_error;
+		}
+		ctx->attr = attr;
 	}
+
+	/* Remove attribute itself. Shrinking a valid record cannot need space. */
+	if (ntfs_attr_record_resize(ctx->mrec, ctx->attr, 0)) {
+		err = -EIO;
+		goto metadata_error;
+	}
+	mark_mft_record_dirty(ni);
 
 	/* Post $ATTRIBUTE_LIST delete setup. */
 	if (type == AT_ATTRIBUTE_LIST) {
@@ -3044,8 +3064,14 @@ int ntfs_attr_record_rm_locked(struct ntfs_attr_search_ctx *ctx)
 
 	}
 out_unlock:
-	kfree(saved_attr);
 	return err;
+
+metadata_error:
+	ntfs_error(base_ni->vol->sb,
+		   "Inconsistent attribute record in inode 0x%llx",
+		   (long long)ni->mft_no);
+	NVolSetErrors(base_ni->vol);
+	goto out_unlock;
 }
 
 /*
