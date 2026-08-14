@@ -353,8 +353,10 @@ int ntfs_attrlist_entry_rm_locked(struct ntfs_attr_search_ctx *ctx)
 	down_write(&base_ni->attr_list_lock);
 	ale = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
 	if (!ale) {
+		err = ntfs_attr_list_is_valid(base_ni->attr_list,
+					      base_ni->attr_list_size) ?
+			-EIO : -EUCLEAN;
 		up_write(&base_ni->attr_list_lock);
-		err = -EIO;
 		goto out_unlock;
 	}
 	ale_len = le16_to_cpu(ale->length);
