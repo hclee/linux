@@ -40,9 +40,7 @@ struct ntfs_wof_workspace {
 	void *input;
 	size_t input_size;
 	void *output;
-	size_t output_size;
 	void *scratch;
-	size_t scratch_size;
 };
 
 static DEFINE_MUTEX(ntfs_wof_xpress4k_lock);
@@ -100,19 +98,19 @@ static struct ntfs_wof_workspace *ntfs_wof_workspace(u8 block_size_bits)
 static int ntfs_wof_workspace_prepare(struct ntfs_wof_workspace *ws)
 {
 	void *input, *output, *scratch;
+	size_t scratch_size;
 
 	if (ws->input)
 		return 0;
 
 	ws->input_size = round_up((size_t)ws->comp_unit + 511, 512);
-	ws->output_size = ws->comp_unit;
-	ws->scratch_size = ws->codec->scratch_size(ws->comp_unit);
-	if (!ws->scratch_size)
+	scratch_size = ws->codec->scratch_size(ws->comp_unit);
+	if (!scratch_size)
 		return -EINVAL;
 
 	input = kvmalloc(ws->input_size, GFP_NOFS);
-	output = kvmalloc(ws->output_size, GFP_NOFS);
-	scratch = kvzalloc(ws->scratch_size, GFP_NOFS);
+	output = kvmalloc(ws->comp_unit, GFP_NOFS);
+	scratch = kvzalloc(scratch_size, GFP_NOFS);
 	if (!input || !output || !scratch) {
 		kvfree(input);
 		kvfree(output);
@@ -421,32 +419,42 @@ static int ntfs_wof_decode(struct ntfs_wof_workspace *ws, const void *src,
 					   dst_len, ws->comp_unit);
 }
 
-static int ntfs_wof_try_direct(struct ntfs_wof_workspace *ws,
-			       struct address_space *mapping,
-			       struct folio *target, loff_t chunk_start,
-			       loff_t chunk_end, const void *src, u32 src_len,
-			       u32 dst_len)
+static int ntfs_wof_decode_page_direct(struct ntfs_wof_workspace *ws,
+				       struct folio *target, loff_t chunk_start,
+				       const void *src, u32 src_len,
+				       u32 dst_len)
 {
 	unsigned int page_offset = offset_in_page(chunk_start);
-	struct ntfs_wof_dest dest;
 	struct page *page;
 	pgoff_t page_index;
 	void *addr;
 	int err;
 
-	if (dst_len <= PAGE_SIZE - page_offset) {
-		page_index = chunk_start >> PAGE_SHIFT;
-		if (!folio_contains(target, page_index))
-			return -EAGAIN;
-		page = folio_page(target, page_index - target->index);
-		addr = kmap_local_page(page);
-		err = ntfs_wof_decode(ws, src, src_len,
-				      (u8 *)addr + page_offset, dst_len);
-		kunmap_local(addr);
-		if (err)
-			return -EINVAL;
-		return 0;
-	}
+	page_index = chunk_start >> PAGE_SHIFT;
+	if (!folio_contains(target, page_index))
+		return -EAGAIN;
+
+	page = folio_page(target, page_index - target->index);
+	addr = kmap_local_page(page);
+	err = ntfs_wof_decode(ws, src, src_len, (u8 *)addr + page_offset,
+			      dst_len);
+	kunmap_local(addr);
+	if (err)
+		return -EINVAL;
+	return 0;
+}
+
+static int ntfs_wof_decode_folios_direct(struct ntfs_wof_workspace *ws,
+					 struct address_space *mapping,
+					 struct folio *target,
+					 loff_t chunk_start, loff_t chunk_end,
+					 const void *src, u32 src_len,
+					 u32 dst_len)
+{
+	unsigned int page_offset = offset_in_page(chunk_start);
+	struct ntfs_wof_dest dest;
+	void *addr;
+	int err;
 
 	err = ntfs_wof_collect_dest(mapping, target, chunk_start, chunk_end,
 				    &dest);
@@ -460,6 +468,7 @@ static int ntfs_wof_try_direct(struct ntfs_wof_workspace *ws,
 		ntfs_wof_release_dest(&dest, target, false);
 		return -EAGAIN;
 	}
+
 	err = ntfs_wof_decode(ws, src, src_len, (u8 *)addr + page_offset,
 			      dst_len);
 	vunmap(addr);
@@ -469,6 +478,22 @@ static int ntfs_wof_try_direct(struct ntfs_wof_workspace *ws,
 	}
 	ntfs_wof_release_dest(&dest, target, true);
 	return 0;
+}
+
+static int ntfs_wof_try_direct(struct ntfs_wof_workspace *ws,
+			       struct address_space *mapping,
+			       struct folio *target, loff_t chunk_start,
+			       loff_t chunk_end, const void *src, u32 src_len,
+			       u32 dst_len)
+{
+	unsigned int page_offset = offset_in_page(chunk_start);
+
+	if (dst_len <= PAGE_SIZE - page_offset)
+		return ntfs_wof_decode_page_direct(ws, target, chunk_start, src,
+						   src_len, dst_len);
+
+	return ntfs_wof_decode_folios_direct(ws, mapping, target, chunk_start,
+					     chunk_end, src, src_len, dst_len);
 }
 
 int ntfs_read_wof_compressed_block(struct folio *folio)
@@ -482,12 +507,10 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 	loff_t folio_start = folio_pos(folio);
 	loff_t folio_end = folio_next_pos(folio);
 	char *chunk_mem;
-	u32 comp_unit, decomp_size;
+	u32 decomp_size;
 	u64 chunk_count, chunk_idx, last_chunk, chunk_offset;
 	int err = 0;
-	bool workspace_locked = false;
 
-	comp_unit = 1U << ni->itype.compressed.block_size_bits;
 	ws = ntfs_wof_workspace(ni->itype.compressed.block_size_bits);
 	if (!ws) {
 		err = -EOPNOTSUPP;
@@ -521,14 +544,14 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 	}
 
 	mutex_lock(ws->lock);
-	workspace_locked = true;
 	err = ntfs_wof_workspace_prepare(ws);
 	if (err)
 		goto out_unlock_ws;
 
-	chunk_idx = div_u64(folio_start, comp_unit);
-	last_chunk = div_u64(min_t(loff_t, folio_end, i_size) - 1, comp_unit);
-	chunk_count = DIV_ROUND_UP_ULL(i_size, comp_unit);
+	chunk_idx = div_u64(folio_start, ws->comp_unit);
+	last_chunk =
+		div_u64(min_t(loff_t, folio_end, i_size) - 1, ws->comp_unit);
+	chunk_count = DIV_ROUND_UP_ULL(i_size, ws->comp_unit);
 	for (; chunk_idx <= last_chunk; chunk_idx++) {
 		u32 chunk_size;
 		u64 chunk_file_offset;
@@ -539,27 +562,24 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 					    ws->input, ws->input_size);
 		if (err)
 			goto out_unlock_ws;
-		if (chunk_size > comp_unit) {
+		if (chunk_size > ws->comp_unit) {
 			ntfs_error(vol->sb,
 				   "Compressed size (%u) > frame size (%u)",
-				   chunk_size, comp_unit);
+				   chunk_size, ws->comp_unit);
 			err = -EINVAL;
 			goto out_unlock_ws;
 		}
 
 		decomp_size = chunk_idx + 1 == chunk_count ?
-				      i_size - (chunk_idx
-						<< ni->itype.compressed
-							   .block_size_bits) :
-				      comp_unit;
+				      i_size - chunk_idx * ws->comp_unit :
+				      ws->comp_unit;
 		err = ntfs_read_wof_chunk(vol, wof_ni, chunk_offset, chunk_size,
 					  ws->input, ws->input_size,
 					  &chunk_mem);
 		if (err)
 			goto out_unlock_ws;
 
-		chunk_file_offset = chunk_idx
-				    << ni->itype.compressed.block_size_bits;
+		chunk_file_offset = chunk_idx * ws->comp_unit;
 		chunk_end = chunk_file_offset + decomp_size;
 		err = ntfs_wof_try_direct(ws, mapping, folio, chunk_file_offset,
 					  chunk_end, chunk_mem, chunk_size,
@@ -588,8 +608,7 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 		folio_zero_segment(folio, i_size - folio_start,
 				   folio_size(folio));
 out_unlock_ws:
-	if (workspace_locked)
-		mutex_unlock(ws->lock);
+	mutex_unlock(ws->lock);
 out_iput:
 	iput(wof_inode);
 out:
