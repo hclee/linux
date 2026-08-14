@@ -266,24 +266,30 @@ static unsigned int ntfs_reparse_tag_mode(__le32 reparse_tag)
 /*
  * Parse reparse point data and initialize its in-memory representation.
  */
-unsigned int ntfs_parse_reparse(struct ntfs_inode *ni)
+int ntfs_parse_reparse(struct ntfs_inode *ni, unsigned int *mode)
 {
 	s64 attr_size = 0;
-	int err;
+	int err = -EINVAL;
 	unsigned int lth;
 	struct reparse_point *reparse_attr;
-	unsigned int mode = 0;
 
 	kvfree(ni->target);
 	ni->target = NULL;
 	ni->reparse_tag = 0;
 	ni->reparse_flags = 0;
+	*mode = 0;
 
 	reparse_attr = ntfs_attr_readall(ni, AT_REPARSE_POINT, NULL, 0,
 					 &attr_size);
-	if (reparse_attr &&
-	    valid_reparse_data(ni, reparse_attr, attr_size)) {
-		err = -EINVAL;
+	if (!reparse_attr) {
+		ntfs_error(ni->vol->sb, "Failed to read reparse point.");
+		return -EIO;
+	}
+	if (!valid_reparse_data(ni, reparse_attr, attr_size)) {
+		ntfs_error(ni->vol->sb, "Invalid reparse point.");
+		err = -EFSCORRUPTED;
+		goto out;
+	}
 
 		switch (reparse_attr->reparse_tag) {
 		case IO_REPARSE_TAG_MOUNT_POINT:
@@ -377,15 +383,15 @@ unsigned int ntfs_parse_reparse(struct ntfs_inode *ni)
 		}
 
 		if (!err) {
-			mode = ntfs_reparse_tag_mode(reparse_attr->reparse_tag);
+			*mode = ntfs_reparse_tag_mode(
+				reparse_attr->reparse_tag);
 			ni->reparse_tag = reparse_attr->reparse_tag;
 		}
-	} else
-		ni->flags &= ~FILE_ATTR_REPARSE_POINT;
 
+out:
 	kvfree(reparse_attr);
 
-	return mode;
+	return err;
 }
 
 unsigned int ntfs_reparse_tag_dt_types(struct ntfs_volume *vol, unsigned long mref)
