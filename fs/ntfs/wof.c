@@ -7,9 +7,10 @@
 
 #include <linux/fs.h>
 #include <linux/blkdev.h>
-#include <linux/highmem.h>
-#include <linux/vmalloc.h>
+#include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 
 #include "ntfs.h"
 #include "inode.h"
@@ -27,6 +28,121 @@ static const __le16 WOF_NAME[] = {
 };
 
 #define WOF_NAME_LEN 17
+
+#define NTFS_WOF_MAX_COMP_UNIT (1U << 15)
+#define NTFS_WOF_MAX_PAGES \
+	DIV_ROUND_UP(NTFS_WOF_MAX_COMP_UNIT + PAGE_SIZE - 1, PAGE_SIZE)
+
+struct ntfs_wof_workspace {
+	struct mutex *lock;
+	const struct ntfs_codec_ops *codec;
+	u32 comp_unit;
+	void *input;
+	size_t input_size;
+	void *output;
+	size_t output_size;
+	void *scratch;
+	size_t scratch_size;
+};
+
+static DEFINE_MUTEX(ntfs_wof_xpress4k_lock);
+static DEFINE_MUTEX(ntfs_wof_xpress8k_lock);
+static DEFINE_MUTEX(ntfs_wof_xpress16k_lock);
+static DEFINE_MUTEX(ntfs_wof_lzx32k_lock);
+
+static struct ntfs_wof_workspace ntfs_wof_xpress4k_workspace = {
+	.lock = &ntfs_wof_xpress4k_lock,
+	.codec = &ntfs_xpress4k_codec_ops,
+	.comp_unit = 1U << 12,
+};
+
+static struct ntfs_wof_workspace ntfs_wof_xpress8k_workspace = {
+	.lock = &ntfs_wof_xpress8k_lock,
+	.codec = &ntfs_xpress8k_codec_ops,
+	.comp_unit = 1U << 13,
+};
+
+static struct ntfs_wof_workspace ntfs_wof_xpress16k_workspace = {
+	.lock = &ntfs_wof_xpress16k_lock,
+	.codec = &ntfs_xpress16k_codec_ops,
+	.comp_unit = 1U << 14,
+};
+
+static struct ntfs_wof_workspace ntfs_wof_lzx32k_workspace = {
+	.lock = &ntfs_wof_lzx32k_lock,
+	.codec = &ntfs_lzx32k_codec_ops,
+	.comp_unit = 1U << 15,
+};
+
+static struct ntfs_wof_workspace *const ntfs_wof_workspaces[] = {
+	&ntfs_wof_xpress4k_workspace,
+	&ntfs_wof_xpress8k_workspace,
+	&ntfs_wof_xpress16k_workspace,
+	&ntfs_wof_lzx32k_workspace,
+};
+
+static struct ntfs_wof_workspace *ntfs_wof_workspace(u8 block_size_bits)
+{
+	switch (block_size_bits) {
+	case 12:
+		return &ntfs_wof_xpress4k_workspace;
+	case 13:
+		return &ntfs_wof_xpress8k_workspace;
+	case 14:
+		return &ntfs_wof_xpress16k_workspace;
+	case 15:
+		return &ntfs_wof_lzx32k_workspace;
+	default:
+		return NULL;
+	}
+}
+
+static int ntfs_wof_workspace_prepare(struct ntfs_wof_workspace *ws)
+{
+	void *input, *output, *scratch;
+
+	if (ws->input)
+		return 0;
+
+	ws->input_size = round_up((size_t)ws->comp_unit + 511, 512);
+	ws->output_size = ws->comp_unit;
+	ws->scratch_size = ws->codec->scratch_size(ws->comp_unit);
+	if (!ws->scratch_size)
+		return -EINVAL;
+
+	input = kvmalloc(ws->input_size, GFP_NOFS);
+	output = kvmalloc(ws->output_size, GFP_NOFS);
+	scratch = kvzalloc(ws->scratch_size, GFP_NOFS);
+	if (!input || !output || !scratch) {
+		kvfree(input);
+		kvfree(output);
+		kvfree(scratch);
+		return -ENOMEM;
+	}
+
+	ws->input = input;
+	ws->output = output;
+	ws->scratch = scratch;
+	return 0;
+}
+
+void ntfs_wof_free_workspaces(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ntfs_wof_workspaces); i++) {
+		struct ntfs_wof_workspace *ws = ntfs_wof_workspaces[i];
+
+		mutex_lock(ws->lock);
+		kvfree(ws->input);
+		kvfree(ws->output);
+		kvfree(ws->scratch);
+		ws->input = NULL;
+		ws->output = NULL;
+		ws->scratch = NULL;
+		mutex_unlock(ws->lock);
+	}
+}
 
 static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runlist,
 				  sector_t start_sector, u32 sector_count, void *buf)
@@ -66,7 +182,6 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 			goto out_unlock;
 		}
 
-		/* Sectors available in remaining clusters of this rl element */
 		sectors = ((rl->vcn + rl->length - vcn) << sec_per_clu_bits) - sec_off;
 		sectors = min_t(u32, sector_count, sectors);
 		byte_off = ntfs_cluster_to_bytes(vol, lcn) + (sec_off << 9);
@@ -94,287 +209,396 @@ out_unlock:
 	return err;
 }
 
-static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx, u64 chunk_count,
-				 u64 *chunk_offset, u32 *chunk_size)
+static int parse_wof_chunk_table(struct ntfs_inode *ni, u64 chunk_idx,
+				 u64 chunk_count, u64 *chunk_offset,
+				 u32 *chunk_size, void *table_buf,
+				 size_t table_buf_size)
 {
 	u8 bytes_per_off;
-	u8 *buf_aligned = NULL, *buf = NULL;
+	u8 *buf;
 	u64 off[2];
-	u64 chunk_data_size;
+	u64 byte_off, chunk_data_size, table_size;
+	u32 bytes_to_read;
 	int ret = 0;
 
-	/* Determine offset table entry size based on file size */
 	if (ni->data_size < (1ULL << 32))
 		bytes_per_off = sizeof(__le32);
 	else
 		bytes_per_off = sizeof(__le64);
 
-	if (!chunk_count ||
-	    ni->data_size < (chunk_count - 1) * bytes_per_off)
+	if (!chunk_count || chunk_idx >= chunk_count)
 		return -EINVAL;
-	chunk_data_size = ni->data_size - (chunk_count - 1) * bytes_per_off;
 
-	if (NInoNonResident(ni)) {
-		u64 byte_off;
-		sector_t start_sector;
-		u32 sector_off, sectors;
+	table_size = (chunk_count - 1) * bytes_per_off;
+	if (ni->data_size < table_size)
+		return -EINVAL;
+	chunk_data_size = ni->data_size - table_size;
 
-		if (chunk_idx > 0)
-			byte_off = (chunk_idx - 1) * bytes_per_off;
-		else
-			byte_off = 0;
+	if (chunk_count == 1) {
+		if (chunk_data_size > U32_MAX)
+			return -EINVAL;
+		*chunk_offset = 0;
+		*chunk_size = chunk_data_size;
+		return 0;
+	}
 
-		start_sector = byte_off >> 9;
-		sector_off = byte_off & ((1 << 9) - 1);
-		sectors = DIV_ROUND_UP(sector_off + 2 * bytes_per_off, 512);
+	byte_off = chunk_idx ? (chunk_idx - 1) * bytes_per_off : 0;
+	bytes_to_read = chunk_idx + 1 == chunk_count ?
+				bytes_per_off :
+				(chunk_idx ? 2 : 1) * bytes_per_off;
 
-		buf_aligned = kmalloc(sectors << 9, GFP_NOFS);
-		if (!buf_aligned)
-			return -ENOMEM;
-		if (ntfs_bdev_read_from_rl(ni->vol, &ni->runlist,
-					   start_sector,
-					   sectors,
-					   buf_aligned)) {
+	if (!NInoNonResident(ni))
+		return -EOPNOTSUPP;
+
+	{
+		sector_t start_sector = byte_off >> 9;
+		u32 sector_off = byte_off & ((1 << 9) - 1);
+		u32 sectors = DIV_ROUND_UP(sector_off + bytes_to_read, 512);
+
+		if ((size_t)sectors << 9 > table_buf_size)
+			return -EINVAL;
+		buf = table_buf;
+		ret = ntfs_bdev_read_from_rl(ni->vol, &ni->runlist,
+					     start_sector, sectors, buf);
+		if (ret) {
 			ret = -EIO;
-			goto out;
+			return ret;
 		}
-		buf = buf_aligned + sector_off;
-
-		if (chunk_idx + 1 == chunk_count) {
-			if (bytes_per_off == sizeof(__le32))
-				((__le32 *)buf)[1] =
-					cpu_to_le32(ni->data_size -
-						    (chunk_count - 1) * bytes_per_off);
-			else
-				((__le64 *)buf)[1] =
-					cpu_to_le64(ni->data_size -
-						    (chunk_count - 1) * bytes_per_off);
-		}
-	} else {
-		/* Resident WOF chunk table logic will be added in Commit 8 */
-		ret = -EOPNOTSUPP;
-		goto out;
+		buf += sector_off;
 	}
 
 	if (bytes_per_off == sizeof(__le32)) {
-		__le32 *addr = (__le32 *)buf;
-
-		off[0] = chunk_idx ? le32_to_cpu(addr[0]) : 0;
-		off[1] = chunk_idx ? le32_to_cpu(addr[1]) : le32_to_cpu(addr[0]);
+		off[0] = chunk_idx ? get_unaligned_le32(buf) : 0;
+		off[1] = chunk_idx + 1 == chunk_count ?
+				 chunk_data_size :
+				 get_unaligned_le32(buf + bytes_per_off);
 	} else {
-		__le64 *addr = (__le64 *)buf;
-
-		off[0] = chunk_idx ? le64_to_cpu(addr[0]) : 0;
-		off[1] = chunk_idx ? le64_to_cpu(addr[1]) : le64_to_cpu(addr[0]);
+		off[0] = chunk_idx ? get_unaligned_le64(buf) : 0;
+		off[1] = chunk_idx + 1 == chunk_count ?
+				 chunk_data_size :
+				 get_unaligned_le64(buf + bytes_per_off);
 	}
 
-	if (off[1] <= off[0] || off[1] > chunk_data_size) {
+	if (off[1] <= off[0] || off[1] > chunk_data_size ||
+	    off[1] - off[0] > U32_MAX) {
 		ret = -EINVAL;
-		goto out;
+		return ret;
 	}
 
-	*chunk_offset = (chunk_count - 1) * bytes_per_off + off[0];
-	*chunk_size = (u32)(off[1] - off[0]);
-
-out:
-	kfree(buf_aligned);
+	*chunk_offset = table_size + off[0];
+	*chunk_size = off[1] - off[0];
 	return ret;
+}
+
+static int ntfs_read_wof_chunk(struct ntfs_volume *vol,
+			       struct ntfs_inode *wof_ni, u64 chunk_offset,
+			       u32 chunk_size, void *input, size_t input_size,
+			       char **chunk_mem)
+{
+	u32 input_offset = chunk_offset & 511;
+	u32 input_size_aligned;
+	int err;
+
+	input_size_aligned = round_up(chunk_size + input_offset, 512);
+	if (input_size_aligned > input_size)
+		return -EINVAL;
+
+	if (!NInoNonResident(wof_ni))
+		return -EOPNOTSUPP;
+
+	err = ntfs_bdev_read_from_rl(vol, &wof_ni->runlist, chunk_offset >> 9,
+				     input_size_aligned >> 9, input);
+	if (err)
+		return err;
+	*chunk_mem = (u8 *)input + input_offset;
+	return 0;
+}
+
+struct ntfs_wof_dest {
+	struct folio *folios[NTFS_WOF_MAX_PAGES];
+	struct page *pages[NTFS_WOF_MAX_PAGES];
+	unsigned int nr_folios;
+	unsigned int nr_pages;
+};
+
+static void ntfs_wof_release_dest(struct ntfs_wof_dest *dest,
+				  struct folio *target, bool success)
+{
+	unsigned int i;
+
+	for (i = 0; i < dest->nr_folios; i++) {
+		struct folio *folio = dest->folios[i];
+
+		if (folio == target)
+			continue;
+		if (success) {
+			flush_dcache_folio(folio);
+			folio_mark_uptodate(folio);
+		} else {
+			folio_clear_uptodate(folio);
+		}
+		folio_unlock(folio);
+		folio_put(folio);
+	}
+}
+
+static int ntfs_wof_collect_dest(struct address_space *mapping,
+				 struct folio *target, loff_t chunk_start,
+				 loff_t chunk_end, struct ntfs_wof_dest *dest)
+{
+	pgoff_t index, last, page_index;
+	unsigned int i;
+
+	memset(dest, 0, sizeof(*dest));
+	index = chunk_start >> PAGE_SHIFT;
+	last = (chunk_end - 1) >> PAGE_SHIFT;
+	while (index <= last) {
+		struct folio *folio;
+		pgoff_t next;
+		bool is_target;
+
+		if (folio_contains(target, index)) {
+			folio = target;
+			is_target = true;
+		} else {
+			folio = __filemap_get_folio(
+				mapping, index,
+				FGP_LOCK | FGP_CREAT | FGP_NOFS | FGP_NOWAIT,
+				GFP_NOFS);
+			if (IS_ERR(folio))
+				return PTR_ERR(folio);
+			is_target = false;
+			if (folio_test_dirty(folio) ||
+			    folio_test_uptodate(folio) ||
+			    folio_pos(folio) < chunk_start ||
+			    folio_next_pos(folio) > chunk_end) {
+				folio_unlock(folio);
+				folio_put(folio);
+				return -EAGAIN;
+			}
+		}
+
+		if (dest->nr_folios == ARRAY_SIZE(dest->folios)) {
+			if (!is_target) {
+				folio_unlock(folio);
+				folio_put(folio);
+			}
+			return -EAGAIN;
+		}
+		dest->folios[dest->nr_folios++] = folio;
+		next = folio->index + folio_nr_pages(folio);
+		if (next <= index)
+			return -EAGAIN;
+		index = next;
+	}
+
+	for (page_index = chunk_start >> PAGE_SHIFT; page_index <= last;
+	     page_index++) {
+		struct folio *folio = NULL;
+
+		for (i = 0; i < dest->nr_folios; i++) {
+			if (folio_contains(dest->folios[i], page_index)) {
+				folio = dest->folios[i];
+				break;
+			}
+		}
+		if (!folio || dest->nr_pages == ARRAY_SIZE(dest->pages))
+			return -EAGAIN;
+		dest->pages[dest->nr_pages++] =
+			folio_page(folio, page_index - folio->index);
+	}
+	return 0;
+}
+
+static int ntfs_wof_decode(struct ntfs_wof_workspace *ws, const void *src,
+			   u32 src_len, void *dst, u32 dst_len)
+{
+	if (src_len == dst_len) {
+		memcpy(dst, src, dst_len);
+		return 0;
+	}
+	return ws->codec->decompress_chunk(ws->scratch, src, src_len, dst,
+					   dst_len, ws->comp_unit);
+}
+
+static int ntfs_wof_try_direct(struct ntfs_wof_workspace *ws,
+			       struct address_space *mapping,
+			       struct folio *target, loff_t chunk_start,
+			       loff_t chunk_end, const void *src, u32 src_len,
+			       u32 dst_len)
+{
+	unsigned int page_offset = offset_in_page(chunk_start);
+	struct ntfs_wof_dest dest;
+	struct page *page;
+	pgoff_t page_index;
+	void *addr;
+	int err;
+
+	if (dst_len <= PAGE_SIZE - page_offset) {
+		page_index = chunk_start >> PAGE_SHIFT;
+		if (!folio_contains(target, page_index))
+			return -EAGAIN;
+		page = folio_page(target, page_index - target->index);
+		addr = kmap_local_page(page);
+		err = ntfs_wof_decode(ws, src, src_len,
+				      (u8 *)addr + page_offset, dst_len);
+		kunmap_local(addr);
+		if (err)
+			return -EINVAL;
+		return 0;
+	}
+
+	err = ntfs_wof_collect_dest(mapping, target, chunk_start, chunk_end,
+				    &dest);
+	if (err) {
+		ntfs_wof_release_dest(&dest, target, false);
+		return -EAGAIN;
+	}
+
+	addr = vmap(dest.pages, dest.nr_pages, VM_MAP, PAGE_KERNEL);
+	if (!addr) {
+		ntfs_wof_release_dest(&dest, target, false);
+		return -EAGAIN;
+	}
+	err = ntfs_wof_decode(ws, src, src_len, (u8 *)addr + page_offset,
+			      dst_len);
+	vunmap(addr);
+	if (err) {
+		ntfs_wof_release_dest(&dest, target, false);
+		return -EINVAL;
+	}
+	ntfs_wof_release_dest(&dest, target, true);
+	return 0;
 }
 
 int ntfs_read_wof_compressed_block(struct folio *folio)
 {
-	struct page *page = &folio->page;
 	struct address_space *mapping = folio->mapping;
 	struct ntfs_inode *ni = NTFS_I(mapping->host), *wof_ni;
 	struct inode *wof_inode;
 	struct ntfs_volume *vol = ni->vol;
+	struct ntfs_wof_workspace *ws;
 	loff_t i_size = i_size_read(VFS_I(ni));
-	char *decomp_mem = NULL, *chunk_mem = NULL, *chunk_mem_aligned;
-	struct page **pages = NULL;
-	u32 comp_unit, pages_per_chunk, chunk_size, chunk_size_aligned, decomp_size;
-	u64 chunk_offset_aligned, chunk_idx, chunk_count, chunk_offset;
-	unsigned long index;
-	int i, err = 0;
-	const struct ntfs_codec_ops *codec;
+	loff_t folio_start = folio_pos(folio);
+	loff_t folio_end = folio_next_pos(folio);
+	char *chunk_mem;
+	u32 comp_unit, decomp_size;
+	u64 chunk_count, chunk_idx, last_chunk, chunk_offset;
+	int err = 0;
+	bool workspace_locked = false;
 
-	index = folio->index;
-
-	/* Determine frame size and frame number */
 	comp_unit = 1U << ni->itype.compressed.block_size_bits;
-	chunk_offset_aligned = (u64)index << PAGE_SHIFT;
-	chunk_offset_aligned &= ~((u64)comp_unit - 1);
-	chunk_idx = chunk_offset_aligned >> ni->itype.compressed.block_size_bits;
-	chunk_count = DIV_ROUND_UP_ULL(i_size, comp_unit);
-
-	/*
-	 * If the requested page is past the end of the file, there is no
-	 * chunk to decompress.  Zero the page and return success.
-	 */
-	if (chunk_idx >= chunk_count) {
-		folio_zero_segments(folio, 0, PAGE_SIZE, 0, 0);
-		SetPageUptodate(page);
-		unlock_page(page);
-		return 0;
-	}
-
-	/* Select codec based on block size bits */
-	switch (ni->itype.compressed.block_size_bits) {
-	case 12:
-		codec = &ntfs_xpress4k_codec_ops;
-		break;
-	case 13:
-		codec = &ntfs_xpress8k_codec_ops;
-		break;
-	case 14:
-		codec = &ntfs_xpress16k_codec_ops;
-		break;
-	case 15:
-		codec = &ntfs_lzx32k_codec_ops;
-		break;
-	default:
-		err = -EINVAL;
+	ws = ntfs_wof_workspace(ni->itype.compressed.block_size_bits);
+	if (!ws) {
+		err = -EOPNOTSUPP;
 		goto out;
 	}
 
-	wof_inode = ntfs_attr_iget(VFS_I(ni), AT_DATA, (__le16 *)WOF_NAME, WOF_NAME_LEN);
+	if (folio_start >= i_size) {
+		folio_zero_segment(folio, 0, folio_size(folio));
+		goto out;
+	}
+
+	wof_inode = ntfs_attr_iget(VFS_I(ni), AT_DATA, (__le16 *)WOF_NAME,
+				   WOF_NAME_LEN);
 	if (IS_ERR(wof_inode)) {
 		err = PTR_ERR(wof_inode);
 		goto out;
 	}
 
 	wof_ni = NTFS_I(wof_inode);
-	if (!wof_ni->runlist.rl) {
-		err = ntfs_attr_map_whole_runlist(wof_ni);
+	if (!NInoNonResident(wof_ni)) {
+		err = -EOPNOTSUPP;
+		goto out_iput;
+	}
+	if (!NInoFullyMapped(wof_ni)) {
+		down_write(&wof_ni->runlist.lock);
+		if (!NInoFullyMapped(wof_ni))
+			err = ntfs_attr_map_whole_runlist(wof_ni);
+		up_write(&wof_ni->runlist.lock);
 		if (err)
 			goto out_iput;
 	}
 
-	err = parse_wof_chunk_table(wof_ni, chunk_idx, chunk_count,
-				    &chunk_offset, &chunk_size);
+	mutex_lock(ws->lock);
+	workspace_locked = true;
+	err = ntfs_wof_workspace_prepare(ws);
 	if (err)
-		goto out_iput;
+		goto out_unlock_ws;
 
-	if (chunk_size > comp_unit) {
-		ntfs_error(vol->sb, "Compressed size (%u) > frame size (%u)",
-			   chunk_size, comp_unit);
-		err = -EINVAL;
-		goto out_iput;
-	}
+	chunk_idx = div_u64(folio_start, comp_unit);
+	last_chunk = div_u64(min_t(loff_t, folio_end, i_size) - 1, comp_unit);
+	chunk_count = DIV_ROUND_UP_ULL(i_size, comp_unit);
+	for (; chunk_idx <= last_chunk; chunk_idx++) {
+		u32 chunk_size;
+		u64 chunk_file_offset;
+		loff_t chunk_end, copy_start, copy_end;
 
-	if (chunk_idx + 1 == chunk_count)
-		decomp_size = 1 + ((i_size - 1) & (comp_unit - 1));
-	else
-		decomp_size = comp_unit;
-
-	/* Allocate pages for the uncompressed chunk */
-	pages_per_chunk = comp_unit >> PAGE_SHIFT;
-	pages = kcalloc(pages_per_chunk, sizeof(struct page *), GFP_NOFS);
-	if (!pages) {
-		err = -ENOMEM;
-		goto out_iput;
-	}
-
-	for (i = 0; i < pages_per_chunk; i++) {
-		unsigned long pg_index = (chunk_offset_aligned >> PAGE_SHIFT) + i;
-		struct page *p;
-
-		if (pg_index == index) {
-			pages[i] = page;
-			continue;
-		}
-		p = grab_cache_page_nowait(mapping, pg_index);
-		if (!p) {
-			err = -ENOMEM;
-			goto out_unlock;
-		}
-		pages[i] = p;
-	}
-
-	decomp_mem = vmap(pages, pages_per_chunk, VM_MAP, PAGE_KERNEL);
-	if (!decomp_mem) {
-		err = -ENOMEM;
-		goto out_unlock;
-	}
-
-	/* Allocate buffer for compressed data */
-	chunk_size_aligned = DIV_ROUND_UP_ULL(chunk_offset + chunk_size, 1 << 9) -
-			     (chunk_offset >> 9);
-	chunk_size_aligned <<= 9;
-	chunk_mem_aligned = kvmalloc(chunk_size_aligned, GFP_NOFS);
-	if (!chunk_mem_aligned) {
-		err = -ENOMEM;
-		goto out_unmap;
-	}
-
-	/* Read compressed data from disk */
-	if (!NInoNonResident(wof_ni)) {
-		/* Resident WOF data read logic will be added in Commit 8 */
-		err = -EOPNOTSUPP;
-		goto out_free;
-	} else {
-		err = ntfs_bdev_read_from_rl(vol, &wof_ni->runlist,
-					     chunk_offset >> 9,
-					     chunk_size_aligned >> 9,
-					     chunk_mem_aligned);
+		err = parse_wof_chunk_table(wof_ni, chunk_idx, chunk_count,
+					    &chunk_offset, &chunk_size,
+					    ws->input, ws->input_size);
 		if (err)
-			goto out_free;
-		chunk_mem = chunk_mem_aligned + (chunk_offset & ((1 << 9) - 1));
-	}
-
-	/* Decompress using codec ops with dynamic scratch */
-	if (chunk_size == decomp_size) {
-		memcpy(decomp_mem, chunk_mem, decomp_size);
-	} else {
-		void *scratch;
-
-		scratch = kvzalloc(codec->scratch_size(comp_unit), GFP_NOFS);
-		if (!scratch) {
-			err = -ENOMEM;
-			goto out_free;
+			goto out_unlock_ws;
+		if (chunk_size > comp_unit) {
+			ntfs_error(vol->sb,
+				   "Compressed size (%u) > frame size (%u)",
+				   chunk_size, comp_unit);
+			err = -EINVAL;
+			goto out_unlock_ws;
 		}
-		err = codec->decompress_chunk(scratch, chunk_mem, chunk_size,
-					      decomp_mem, decomp_size, comp_unit);
-		kvfree(scratch);
+
+		decomp_size = chunk_idx + 1 == chunk_count ?
+				      i_size - (chunk_idx
+						<< ni->itype.compressed
+							   .block_size_bits) :
+				      comp_unit;
+		err = ntfs_read_wof_chunk(vol, wof_ni, chunk_offset, chunk_size,
+					  ws->input, ws->input_size,
+					  &chunk_mem);
+		if (err)
+			goto out_unlock_ws;
+
+		chunk_file_offset = chunk_idx
+				    << ni->itype.compressed.block_size_bits;
+		chunk_end = chunk_file_offset + decomp_size;
+		err = ntfs_wof_try_direct(ws, mapping, folio, chunk_file_offset,
+					  chunk_end, chunk_mem, chunk_size,
+					  decomp_size);
+		if (!err)
+			continue;
+		if (err != -EAGAIN)
+			goto out_unlock_ws;
+
+		err = ntfs_wof_decode(ws, chunk_mem, chunk_size, ws->output,
+				      decomp_size);
 		if (err) {
 			ntfs_error(vol->sb, "Decompression failed: %d", err);
 			err = -EINVAL;
-			goto out_free;
+			goto out_unlock_ws;
 		}
+		copy_start = max_t(loff_t, folio_start, chunk_file_offset);
+		copy_end = min_t(loff_t, folio_end,
+				 chunk_file_offset + decomp_size);
+		memcpy_to_folio(folio, copy_start - folio_start,
+				ws->output + copy_start - chunk_file_offset,
+				copy_end - copy_start);
 	}
 
-	/* Zero any partial page at end */
-	if (decomp_size < comp_unit)
-		memset(decomp_mem + decomp_size, 0, comp_unit - decomp_size);
-
-	/* Mark pages as uptodate */
-	for (i = 0; i < pages_per_chunk; i++) {
-		if (pages[i]) {
-			SetPageUptodate(pages[i]);
-			flush_dcache_page(pages[i]);
-		}
-	}
-
-out_free:
-	kvfree(chunk_mem_aligned);
-out_unmap:
-	vunmap(decomp_mem);
-out_unlock:
-	for (i = 0; i < pages_per_chunk; i++) {
-		if (pages[i] && pages[i] != page) {
-			if (err)
-				ClearPageUptodate(pages[i]);
-			unlock_page(pages[i]);
-			put_page(pages[i]);
-		}
-	}
-	kfree(pages);
+	if (folio_end > i_size)
+		folio_zero_segment(folio, i_size - folio_start,
+				   folio_size(folio));
+out_unlock_ws:
+	if (workspace_locked)
+		mutex_unlock(ws->lock);
 out_iput:
 	iput(wof_inode);
 out:
-	if (err)
-		ClearPageUptodate(page);
-	else
-		SetPageUptodate(page);
-	unlock_page(page);
+	if (!err) {
+		flush_dcache_folio(folio);
+		folio_mark_uptodate(folio);
+	} else {
+		folio_clear_uptodate(folio);
+	}
+	folio_unlock(folio);
 	return err;
 }
