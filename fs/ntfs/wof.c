@@ -7,6 +7,7 @@
 
 #include <linux/fs.h>
 #include <linux/blkdev.h>
+#include <linux/overflow.h>
 #include <linux/pagemap.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -147,12 +148,19 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 				  sector_t start_sector, u32 sector_count, void *buf)
 {
 	struct runlist_element *rl;
-	u32 sec_per_clu_bits = vol->cluster_size_bits - 9;
-	s64 vcn = start_sector >> sec_per_clu_bits;
-	u32 sec_off = start_sector & ((1 << sec_per_clu_bits) - 1);
-	u32 buf_off = 0;
+	u32 sec_per_clu_bits;
+	s64 vcn;
+	u64 sec_off;
+	u64 remaining = sector_count;
+	size_t buf_off = 0;
 	unsigned int nofs_flags;
 	int err;
+
+	if (vol->cluster_size_bits < 9 || vol->cluster_size_bits - 9 >= 64)
+		return -EINVAL;
+	sec_per_clu_bits = vol->cluster_size_bits - 9;
+	vcn = start_sector >> sec_per_clu_bits;
+	sec_off = start_sector & ((1ULL << sec_per_clu_bits) - 1);
 
 	nofs_flags = memalloc_nofs_save();
 	down_read(&runlist->lock);
@@ -167,12 +175,12 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 		goto out_unlock;
 	}
 
-	while (sector_count > 0) {
+	while (remaining > 0) {
 		s64 lcn;
-		loff_t byte_off;
-		u32 byte_len, sectors;
+		s64 rl_end;
+		u64 byte_off, byte_len, sectors, available;
 
-		if (!rl->length || vcn < rl->vcn) {
+		if (rl->length <= 0 || vcn < rl->vcn) {
 			err = -EINVAL;
 			goto out_unlock;
 		}
@@ -183,22 +191,44 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 			goto out_unlock;
 		}
 
-		sectors = ((rl->vcn + rl->length - vcn) << sec_per_clu_bits) - sec_off;
-		sectors = min_t(u32, sector_count, sectors);
-		byte_off = ntfs_cluster_to_bytes(vol, lcn) + (sec_off << 9);
-		byte_len = sectors << 9;
+		if (check_add_overflow(rl->vcn, rl->length, &rl_end) ||
+		    rl_end <= vcn ||
+		    (u64)(rl_end - vcn) > (U64_MAX >> sec_per_clu_bits)) {
+			err = -EOVERFLOW;
+			goto out_unlock;
+		}
+		available = (u64)(rl_end - vcn) << sec_per_clu_bits;
+		if (available <= sec_off) {
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		available -= sec_off;
+		sectors = min_t(u64, remaining, available);
+		if (check_mul_overflow(sectors, (u64)SECTOR_SIZE, &byte_len) ||
+		    byte_len > SIZE_MAX - buf_off) {
+			err = -EOVERFLOW;
+			goto out_unlock;
+		}
 
 		if (lcn == LCN_HOLE) {
 			memset((u8 *)buf + buf_off, 0, byte_len);
 		} else {
-			err = ntfs_bdev_read(vol->sb->s_bdev, (char *)buf + buf_off,
-					     byte_off, byte_len);
+			byte_off = ntfs_cluster_to_bytes(vol, lcn);
+			if (check_add_overflow(byte_off, sec_off << 9,
+					       &byte_off) ||
+			    byte_off > S64_MAX) {
+				err = -EOVERFLOW;
+				goto out_unlock;
+			}
+			err = ntfs_bdev_read(vol->sb->s_bdev,
+					     (char *)buf + buf_off,
+					     (loff_t)byte_off, byte_len);
 			if (err)
 				goto out_unlock;
 		}
 
 		buf_off += byte_len;
-		sector_count -= sectors;
+		remaining -= sectors;
 		rl++;
 		vcn = rl->vcn;
 		sec_off = 0;
