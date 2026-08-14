@@ -151,12 +151,14 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 	s64 vcn = start_sector >> sec_per_clu_bits;
 	u32 sec_off = start_sector & ((1 << sec_per_clu_bits) - 1);
 	u32 buf_off = 0;
+	unsigned int nofs_flags;
 	int err;
 
+	nofs_flags = memalloc_nofs_save();
 	down_read(&runlist->lock);
 	if (!runlist->rl) {
-		up_read(&runlist->lock);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out_unlock;
 	}
 
 	rl = __ntfs_attr_find_vcn_nolock(runlist, vcn);
@@ -205,6 +207,7 @@ static int ntfs_bdev_read_from_rl(struct ntfs_volume *vol, struct runlist *runli
 	err = 0;
 out_unlock:
 	up_read(&runlist->lock);
+	memalloc_nofs_restore(nofs_flags);
 	return err;
 }
 
