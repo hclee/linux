@@ -1561,14 +1561,18 @@ do_next_attr_loop:
 		if (mft_free_len >= sizeof(a->type) && a->type == AT_END) {
 			down_read(&base_ni->attr_list_lock);
 			attr_list_locked = true;
+			if (!NInoAttrList(base_ni) || !base_ni->attr_list ||
+			    ctx->al_exact.gen != base_ni->attr_list_gen)
+				goto restart_lookup;
 			al_start = base_ni->attr_list;
 			al_end = al_start + base_ni->attr_list_size;
 			al_entry = ntfs_attrlist_find_exact_locked(base_ni,
 								   &ctx->al_exact);
 			if (!al_entry) {
-				if (ctx->al_exact.gen != base_ni->attr_list_gen)
-					goto restart_lookup;
-				goto corrupt;
+				if (!ntfs_attr_list_is_valid(base_ni->attr_list,
+							     base_ni->attr_list_size))
+					goto corrupt;
+				goto locator_invalid;
 			}
 			al_entry = (struct attr_list_entry *)((u8 *)al_entry +
 							      le16_to_cpu(al_entry->length));
@@ -1604,11 +1608,15 @@ do_next_attr_loop:
 		 */
 		down_read(&base_ni->attr_list_lock);
 		attr_list_locked = true;
+		if (!NInoAttrList(base_ni) || !base_ni->attr_list ||
+		    ctx->al_exact.gen != base_ni->attr_list_gen)
+			goto restart_lookup;
 		al_entry = ntfs_attrlist_find_exact_locked(base_ni, &ctx->al_exact);
 		if (!al_entry) {
-			if (ctx->al_exact.gen != base_ni->attr_list_gen)
-				goto restart_lookup;
-			goto corrupt;
+			if (!ntfs_attr_list_is_valid(base_ni->attr_list,
+						     base_ni->attr_list_size))
+				goto corrupt;
+			goto locator_invalid;
 		}
 		if (!ntfs_are_names_equal((__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
 					  a->name_length, al_entry->name,
@@ -1656,6 +1664,22 @@ restart_lookup:
 	attr_list_locked = false;
 	ntfs_attr_reinit_search_ctx(ctx);
 	goto restart;
+
+locator_invalid:
+	if (ni != base_ni) {
+		if (ni)
+			unmap_extent_mft_record(ni);
+		ctx->ntfs_ino = base_ni;
+		ctx->mrec = ctx->base_mrec;
+		ctx->attr = ctx->base_attr;
+		ctx->mapped_mrec = ctx->mapped_base_mrec;
+	}
+	ntfs_error(
+		vol->sb,
+		"Failed to relocate unchanged attribute-list entry for base inode 0x%llx",
+		(long long)base_ni->mft_no);
+	err = -EIO;
+	goto unlock_list_attr;
 
 corrupt:
 	if (ni != base_ni) {
