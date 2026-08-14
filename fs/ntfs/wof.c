@@ -618,17 +618,18 @@ int ntfs_read_wof_compressed_block(struct folio *folio)
 					    ws->input, ws->input_size);
 		if (err)
 			goto out_unlock_ws;
-		if (chunk_size > ws->comp_unit) {
-			ntfs_error(vol->sb,
-				   "Compressed size (%u) > frame size (%u)",
-				   chunk_size, ws->comp_unit);
+		decomp_size = chunk_idx + 1 == chunk_count ?
+				      i_size - chunk_idx * ws->comp_unit :
+				      ws->comp_unit;
+		if (!chunk_size || chunk_size > decomp_size) {
+			ntfs_error(
+				vol->sb,
+				"Invalid compressed size (%u) for frame size (%u)",
+				chunk_size, decomp_size);
 			err = -EINVAL;
 			goto out_unlock_ws;
 		}
 
-		decomp_size = chunk_idx + 1 == chunk_count ?
-				      i_size - chunk_idx * ws->comp_unit :
-				      ws->comp_unit;
 		err = ntfs_read_wof_chunk(vol, wof_ni, chunk_offset, chunk_size,
 					  ws->input, ws->input_size,
 					  &chunk_mem);
