@@ -12,6 +12,7 @@
 
 #include <linux/stddef.h>
 #include <linux/kernel.h>
+#include <linux/blkdev.h>
 #include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/compiler.h>
@@ -70,8 +71,6 @@
 				    PAGE_SHIFT)
 #define NTFS_CLU_TO_POFS(vol, clu) (((u64)(clu) << (vol)->cluster_size_bits) & \
 				    ~PAGE_MASK)
-
-#define NTFS_B_TO_SECTOR(vol, b) ((b) >> ((vol)->sb)->s_blocksize_bits)
 
 enum {
 	NTFS_BLOCK_SIZE		= 512,
@@ -158,7 +157,7 @@ static inline u64 ntfs_cluster_to_poff(const struct ntfs_volume *vol,
 static inline sector_t ntfs_bytes_to_sector(const struct ntfs_volume *vol,
 		u64 bytes)
 {
-	return bytes >> vol->sb->s_blocksize_bits;
+	return bytes >> SECTOR_SHIFT;
 }
 
 /* Global variables. */

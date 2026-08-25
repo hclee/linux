@@ -443,6 +443,35 @@ static void ntfs_bio_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+static int ntfs_mft_folio_write(struct ntfs_volume *vol,
+		struct folio *folio, unsigned int folio_ofs, s64 lcn,
+		unsigned int clu_off)
+{
+	unsigned int block_size = vol->sb->s_blocksize;
+	struct bio *bio;
+	int err;
+
+	if (WARN_ON(folio_ofs & (block_size - 1)) ||
+	    WARN_ON(clu_off & (block_size - 1)) ||
+	    WARN_ON(folio_ofs + block_size > folio_size(folio)) ||
+	    WARN_ON(clu_off + block_size > vol->cluster_size))
+		return -EINVAL;
+	if (lcn < 0)
+		return -EIO;
+
+	bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
+	bio->bi_iter.bi_sector =
+		ntfs_bytes_to_sector(vol, NTFS_CLU_TO_B(vol, lcn) + clu_off);
+	if (bio_add_folio(bio, folio, block_size, folio_ofs) != block_size) {
+		bio_put(bio);
+		return -EIO;
+	}
+
+	err = submit_bio_wait(bio);
+	bio_put(bio);
+	return err;
+}
+
 /*
  * ntfs_sync_mft_mirror - synchronize an mft record to the mft mirror
  * @vol:	ntfs volume on which the mft record to synchronize resides
@@ -464,7 +493,6 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 	struct folio *folio;
 	unsigned int folio_ofs, lcn_folio_off = 0;
 	int err = 0;
-	struct bio *bio;
 
 	ntfs_debug("Entering for inode 0x%llx.", mft_no);
 
@@ -497,16 +525,34 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const u64 mft_no,
 		lcn_folio_off &= vol->cluster_size_mask;
 	}
 
-	bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
-	bio->bi_iter.bi_sector =
-		NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, vol->mftmirr_lcn) +
-				 lcn_folio_off + folio_ofs);
+	if (vol->mft_record_size < vol->sb->s_blocksize) {
+		u64 block_pos = (folio_pos(folio) + folio_ofs) &
+				~((u64)vol->sb->s_blocksize - 1);
+		s64 block_lcn;
+		unsigned int block_ofs = folio_ofs &
+				~(vol->sb->s_blocksize - 1);
+		unsigned int clu_off = ntfs_bytes_to_cluster_off(vol, block_pos);
 
-	if (bio_add_folio(bio, folio, vol->mft_record_size, folio_ofs))
-		err = submit_bio_wait(bio);
-	else
-		err = -EIO;
-	bio_put(bio);
+		down_read(&NTFS_I(vol->mftmirr_ino)->runlist.lock);
+		block_lcn = ntfs_attr_vcn_to_lcn_nolock(
+			NTFS_I(vol->mftmirr_ino),
+			ntfs_bytes_to_cluster(vol, block_pos), false);
+		up_read(&NTFS_I(vol->mftmirr_ino)->runlist.lock);
+		err = ntfs_mft_folio_write(vol, folio, block_ofs, block_lcn,
+			clu_off);
+	} else {
+		struct bio *bio;
+
+		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
+		bio->bi_iter.bi_sector =
+			ntfs_bytes_to_sector(vol, NTFS_CLU_TO_B(vol, vol->mftmirr_lcn) +
+					 lcn_folio_off + folio_ofs);
+		if (bio_add_folio(bio, folio, vol->mft_record_size, folio_ofs))
+			err = submit_bio_wait(bio);
+		else
+			err = -EIO;
+		bio_put(bio);
+	}
 
 	/*
 	 * The in-memory mirror is now valid because we just memcpy()'d the
@@ -583,6 +629,36 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		goto err_out;
 	}
 
+	if (vol->mft_record_size < vol->sb->s_blocksize) {
+		unsigned int clu_off;
+		unsigned int folio_ofs;
+
+		/*
+		 * A 4K-native device cannot accept a write for a smaller MFT
+		 * record.  Write the containing device block from the MFT folio
+		 * so that all records in the block are transferred together.
+		 */
+		clu_off = ((u64)ni->mft_no * vol->mft_record_size) &
+				vol->cluster_size_mask;
+		clu_off &= ~(vol->sb->s_blocksize - 1);
+		folio_ofs = ni->folio_ofs & ~(vol->sb->s_blocksize - 1);
+
+		err = ntfs_mft_folio_write(vol, folio, folio_ofs,
+			ni->mft_lcn[0], clu_off);
+
+		if (!err && ni->mft_no < vol->mftmirr_size)
+			err = ntfs_sync_mft_mirror(vol, ni->mft_no, fixup_m);
+
+		kunmap_local(kaddr);
+		if (unlikely(err)) {
+			ntfs_error(vol->sb,
+				"I/O error while writing mft record 0x%llx!  Marking base inode as bad.  You should unmount the volume and run chkdsk.",
+				ni->mft_no);
+			goto err_out;
+		}
+		goto done;
+	}
+
 	folio_size = vol->mft_record_size / ni->mft_lcn_count;
 	while (i < ni->mft_lcn_count) {
 		unsigned int clu_off;
@@ -592,7 +668,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 
 		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
 		bio->bi_iter.bi_sector =
-			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
+			ntfs_bytes_to_sector(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
 					 clu_off);
 
 		if (!bio_add_folio(bio, folio, folio_size,
@@ -2637,6 +2713,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 	s64 end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
 	unsigned int folio_sz;
 	loff_t i_size = i_size_read(vi);
+	bool redirty = false;
 
 	ntfs_debug("Entering for inode 0x%llx, attribute type 0x%x, folio index 0x%lx.",
 			ni->mft_no, ni->type, folio->index);
@@ -2666,6 +2743,123 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 	kaddr = kmap_local_folio(folio, 0);
 	/* Clear the page uptodate flag whilst the mst fixups are applied. */
 	folio_clear_uptodate(folio);
+
+	if (vol->mft_record_size < vol->sb->s_blocksize) {
+		bool write_records[PAGE_SIZE / NTFS_BLOCK_SIZE] = {};
+		bool written_records[PAGE_SIZE / NTFS_BLOCK_SIZE] = {};
+		unsigned int block_size = vol->sb->s_blocksize;
+
+		for (mft_ofs = 0; mft_ofs < PAGE_SIZE; mft_ofs +=
+				vol->mft_record_size) {
+			u64 file_pos = ((u64)folio->index << PAGE_SHIFT) + mft_ofs;
+
+			if (file_pos >= ni->allocated_size)
+				break;
+
+			mft_no = file_pos >> vol->mft_record_size_bits;
+			tni = NULL;
+			if (ntfs_may_write_mft_record(vol, mft_no,
+					(struct mft_record *)(kaddr + mft_ofs),
+					&tni, &ref_inos[nr_ref_inos])) {
+				write_records[mft_ofs / vol->mft_record_size] = true;
+
+				if (tni)
+					locked_nis[nr_locked_nis++] = tni;
+				else if (ref_inos[nr_ref_inos])
+					nr_ref_inos++;
+			} else if (ref_inos[nr_ref_inos])
+				nr_ref_inos++;
+		}
+
+		for (mft_ofs = 0; mft_ofs < PAGE_SIZE;
+				mft_ofs += block_size) {
+			u64 block_pos = ((u64)folio->index << PAGE_SHIFT) +
+					mft_ofs;
+			unsigned int record_ofs;
+			bool block_has_record = false;
+			bool block_has_writable = false;
+			bool block_all_writable = true;
+
+			for (record_ofs = mft_ofs;
+			     record_ofs < mft_ofs + block_size;
+			     record_ofs += vol->mft_record_size) {
+				u64 file_pos;
+
+				file_pos = ((u64)folio->index << PAGE_SHIFT) +
+						record_ofs;
+				if (file_pos >= ni->allocated_size)
+					break;
+				block_has_record = true;
+				if (write_records[record_ofs /
+						vol->mft_record_size])
+					block_has_writable = true;
+				else
+					block_all_writable = false;
+			}
+
+			if (!block_has_record || !block_has_writable)
+				continue;
+			if (!block_all_writable) {
+				redirty = true;
+				continue;
+			}
+
+			{
+				s64 block_vcn, block_lcn;
+
+				block_vcn = ntfs_bytes_to_cluster(vol, block_pos);
+				down_read(&ni->runlist.lock);
+				block_lcn = ntfs_attr_vcn_to_lcn_nolock(ni,
+						block_vcn, false);
+				up_read(&ni->runlist.lock);
+				err = ntfs_mft_folio_write(vol, folio, mft_ofs,
+					block_lcn,
+					ntfs_bytes_to_cluster_off(vol,
+						block_pos));
+			}
+			if (err)
+				break;
+
+			for (record_ofs = mft_ofs;
+			     record_ofs < mft_ofs + block_size;
+			     record_ofs += vol->mft_record_size) {
+				u64 file_pos;
+
+				file_pos = ((u64)folio->index << PAGE_SHIFT) +
+						record_ofs;
+				if (file_pos >= ni->allocated_size)
+					break;
+				written_records[record_ofs /
+						vol->mft_record_size] = true;
+			}
+		}
+
+		if (!err) {
+			for (mft_ofs = 0; mft_ofs < PAGE_SIZE; mft_ofs +=
+					vol->mft_record_size) {
+				u64 file_pos = ((u64)folio->index << PAGE_SHIFT) +
+						mft_ofs;
+
+				if (file_pos >= ni->allocated_size)
+					break;
+				if (!written_records[mft_ofs /
+						vol->mft_record_size])
+					continue;
+
+				mft_no = file_pos >> vol->mft_record_size_bits;
+				if (mft_no < vol->mftmirr_size) {
+					int sub_err = ntfs_sync_mft_mirror(vol,
+						mft_no,
+						(struct mft_record *)(kaddr +
+							mft_ofs));
+
+					if (sub_err && !err)
+						err = sub_err;
+				}
+			}
+		}
+		goto unm_done;
+	}
 
 	for (mft_ofs = 0; mft_ofs < PAGE_SIZE && vcn < end_vcn;
 	     mft_ofs += vol->mft_record_size) {
@@ -2774,9 +2968,14 @@ unm_done:
 	folio_mark_uptodate(folio);
 	kunmap_local(kaddr);
 
-	folio_start_writeback(folio);
-	folio_unlock(folio);
-	folio_end_writeback(folio);
+	if (redirty && !err) {
+		folio_redirty_for_writepage(wbc, folio);
+		folio_unlock(folio);
+	} else {
+		folio_start_writeback(folio);
+		folio_unlock(folio);
+		folio_end_writeback(folio);
+	}
 
 	/* Unlock any locked inodes. */
 	while (nr_locked_nis-- > 0) {
